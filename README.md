@@ -87,7 +87,7 @@ rebuild the index from scratch.
 uv run pytest
 ```
 
-33 tests, no Ollama needed. The embedding call is stubbed, because what needs checking is the
+36 tests, no Ollama needed. The embedding call is stubbed, because what needs checking is the
 code around the model rather than the model.
 
 ```
