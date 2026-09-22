@@ -36,7 +36,10 @@ def embed_documents(texts: list[str], model: str) -> list[list[float]]:
     if not texts:
         return []
     _query_prefix, document_prefix = PREFIXES.get(base_name(model), ("", ""))
-    payload = request("/api/embed", {"model": model, "input": [document_prefix + t for t in texts]})
+    payload = request(
+        "/api/embed",
+        {"model": model, "input": [document_prefix + text for text in texts]},
+    )
     return payload.get("embeddings", [])
 
 

@@ -9,7 +9,7 @@ import streamlit as st
 
 from brain import ollama
 from brain.answer import NOTHING_FOUND, build_messages, source_budget
-from brain.search import Hit, search
+from brain.search import Hit, Scope, search
 
 
 def render(
@@ -18,6 +18,7 @@ def render(
     embedding_model: str,
     passages: int,
     context_size: int,
+    scope: Scope,
 ) -> None:
     history = st.session_state.setdefault("history", [])
 
@@ -26,6 +27,9 @@ def render(
             st.markdown(turn["text"])
             if turn.get("sources"):
                 show_sources(turn["sources"])
+
+    if not scope.is_everything:
+        st.caption("Answering from the filtered notes only. Clear the filters to widen it.")
 
     question = st.chat_input("Ask your vault something")
     if not question:
@@ -38,7 +42,9 @@ def render(
     with st.chat_message("assistant"):
         try:
             with st.spinner("Searching your notes"):
-                hits = search(connection, question, embedding_model, limit=passages)
+                hits = search(
+                    connection, question, embedding_model, limit=passages, scope=scope
+                )
             if not hits:
                 st.markdown(NOTHING_FOUND)
                 history.append({"role": "assistant", "text": NOTHING_FOUND})
@@ -60,5 +66,10 @@ def show_sources(hits: list[Hit]) -> None:
             if hit.heading:
                 label += f"  ·  {hit.heading}"
             st.markdown(f"**[{number}] {label}**")
-            st.caption(f"{hit.path}  ·  found by {', '.join(sorted(hit.found_by))}")
+            details = [hit.path, f"found by {', '.join(sorted(hit.found_by))}"]
+            if hit.kind:
+                details.insert(1, hit.kind)
+            if hit.created:
+                details.insert(1, hit.created)
+            st.caption("  ·  ".join(details))
             st.text(hit.text[:1500])

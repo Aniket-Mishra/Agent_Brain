@@ -8,6 +8,9 @@ from pathlib import Path
 import streamlit as st
 
 from brain import index, links
+from brain.notes import Note, read_note
+from brain.search import similar_notes
+from views import notelist
 
 
 def render(connection: sqlite3.Connection, vault: Path) -> None:
@@ -65,9 +68,7 @@ def note_buttons(paths: list[str], key: str) -> str | None:
     # A fixed height keeps the list scrolling on its own. Without it a folder of
     # 174 notes pushes the note being read off the bottom of the page.
     with st.container(height=520):
-        for path in paths:
-            if st.button(Path(path).stem, key=f"{key}:{path}", use_container_width=True):
-                st.session_state["selected_note"] = path
+        notelist.show(paths, key=key, shown=len(paths))
     return st.session_state.get("selected_note")
 
 
@@ -76,27 +77,59 @@ def show_note(connection: sqlite3.Connection, vault: Path, path: str | None) -> 
         st.info("Pick a note on the left.")
         return
 
-    st.subheader(Path(path).stem)
+    full_path = vault / path
+    note = read_note(full_path, vault) if full_path.is_file() else None
+
+    st.subheader(note.title if note else Path(path).stem)
     st.caption(path)
+    if note:
+        show_metadata(note)
 
     pointing_here = links.backlinks(connection, path)
     pointing_out = links.outgoing(connection, path)
     if pointing_here or pointing_out:
         left, right = st.columns(2)
         left.caption(f"**{count_notes(pointing_here)} in**")
-        for source in pointing_here[:15]:
-            left.markdown(f"- {Path(source).stem}")
+        show_link_list(left, pointing_here)
         right.caption(f"**{count_notes(pointing_out)} out**")
-        for target in pointing_out[:15]:
-            right.markdown(f"- {Path(target).stem}")
+        show_link_list(right, pointing_out)
 
-    full_path = vault / path
-    if not full_path.is_file():
+    show_similar(connection, path)
+
+    if note is None:
         return
     st.divider()
     with st.container(height=520):
-        st.markdown(full_path.read_text(encoding="utf-8", errors="replace"))
+        # The parsed body, so the YAML block does not land on the page as a
+        # paragraph of `type: college_notes tags: ... subject_code:`.
+        st.markdown(note.body)
+
+
+def show_metadata(note: Note) -> None:
+    parts = [part for part in (note.created, note.kind) if part]
+    if note.tags:
+        parts.append(" ".join(f"`{tag}`" for tag in note.tags[:6]))
+    if parts:
+        st.caption("  ·  ".join(parts))
+
+
+def show_similar(connection: sqlite3.Connection, path: str) -> None:
+    """Close notes this one does not link to, which are links worth making."""
+    nearby = similar_notes(connection, path, limit=5)
+    if not nearby:
+        return
+    # The scores sit between 0.93 and 0.94 across the whole vault, so the order
+    # carries meaning and the number does not. Showing it would imply precision
+    # that is not there.
+    st.caption("**Related, and not yet linked**")
+    notelist.show([other for other, _score in nearby], key="similar", shown=len(nearby))
 
 
 def count_notes(paths: list[str]) -> str:
     return "1 note" if len(paths) == 1 else f"{len(paths)} notes"
+
+
+def show_link_list(column, paths: list[str], shown: int = 15) -> None:
+    labels = notelist.labels_for(paths[:shown])
+    for path in paths[:shown]:
+        column.markdown(f"- {labels[path]}")

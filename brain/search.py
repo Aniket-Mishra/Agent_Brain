@@ -27,6 +27,39 @@ QUOTED_OR_WORD = re.compile(r'"[^"]+"|\S+')
 NON_WORD = re.compile(r"[^\w/-]+", re.UNICODE)
 
 
+@dataclass(frozen=True)
+class Scope:
+    """Which notes a search is allowed to look at.
+
+    Filtering belongs in the queries rather than after them. Retrieving thirty
+    passages and then discarding the ones outside the range would leave two.
+    """
+
+    kinds: tuple[str, ...] = ()
+    since: str = ""
+    until: str = ""
+
+    def clause(self) -> tuple[str, list[str]]:
+        """A SQL fragment restricting `notes`, plus its parameters."""
+        tests, values = [], []
+        if self.kinds:
+            tests.append(f"notes.kind IN ({','.join('?' * len(self.kinds))})")
+            values.extend(self.kinds)
+        # Notes with no date are excluded once a range is set, because an
+        # undated note cannot honestly be said to fall inside it.
+        if self.since:
+            tests.append("notes.created >= ?")
+            values.append(self.since)
+        if self.until:
+            tests.append("notes.created <= ?")
+            values.append(self.until)
+        return (" AND ".join(tests) if tests else "1=1"), values
+
+    @property
+    def is_everything(self) -> bool:
+        return not (self.kinds or self.since or self.until)
+
+
 @dataclass
 class Hit:
     chunk_id: int
@@ -34,6 +67,8 @@ class Hit:
     title: str
     heading: str
     text: str
+    kind: str = ""
+    created: str = ""
     score: float = 0.0
     found_by: set[str] = field(default_factory=set)
 
@@ -67,29 +102,38 @@ def unwrap_phrase(token: str) -> str:
     return token[1:-1].replace('"', "").strip()
 
 
-def by_words(connection: sqlite3.Connection, question: str, limit: int) -> list[Hit]:
+def by_words(
+    connection: sqlite3.Connection, question: str, limit: int, scope: Scope
+) -> list[Hit]:
     match = to_match_query(question)
     if not match:
         return []
+    where, values = scope.clause()
     rows = connection.execute(
-        """
+        f"""
         SELECT chunks.id
         FROM chunks_fts
         JOIN chunks ON chunks.id = chunks_fts.rowid
-        WHERE chunks_fts MATCH ?
+        JOIN notes ON notes.path = chunks.path
+        WHERE chunks_fts MATCH ? AND {where}
         ORDER BY bm25(chunks_fts, 1.0, 0.5) LIMIT ?
         """,
-        (match, limit),
+        [match, *values, limit],
     ).fetchall()
     return load_hits(connection, [row["id"] for row in rows], "words")
 
 
-def by_meaning(connection: sqlite3.Connection, question: str, model: str, limit: int) -> list[Hit]:
+def by_meaning(
+    connection: sqlite3.Connection, question: str, model: str, limit: int, scope: Scope
+) -> list[Hit]:
     # Ranking needs only the vectors, so the text is fetched afterwards for the
     # few that survive. This is not measurably faster at 2,600 passages, it just
     # keeps both retrievers producing ids and leaves one place that builds Hits.
+    where, values = scope.clause()
     rows = connection.execute(
-        "SELECT id, vector FROM chunks WHERE vector IS NOT NULL"
+        "SELECT chunks.id, chunks.vector FROM chunks JOIN notes ON notes.path = chunks.path "
+        f"WHERE chunks.vector IS NOT NULL AND {where}",
+        values,
     ).fetchall()
     if not rows:
         return []
@@ -118,7 +162,8 @@ def load_hits(connection: sqlite3.Connection, chunk_ids: list[int], found_by: st
         return []
     placeholders = ",".join("?" * len(chunk_ids))
     rows = connection.execute(
-        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, notes.title "
+        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, "
+        "notes.title, notes.kind, notes.created "
         f"FROM chunks JOIN notes ON notes.path = chunks.path WHERE chunks.id IN ({placeholders})",
         chunk_ids,
     ).fetchall()
@@ -126,7 +171,13 @@ def load_hits(connection: sqlite3.Connection, chunk_ids: list[int], found_by: st
     return [to_hit(by_id[chunk_id], found_by) for chunk_id in chunk_ids if chunk_id in by_id]
 
 
-def search(connection: sqlite3.Connection, question: str, model: str, limit: int = 8) -> list[Hit]:
+def search(
+    connection: sqlite3.Connection,
+    question: str,
+    model: str,
+    limit: int = 8,
+    scope: Scope | None = None,
+) -> list[Hit]:
     """Merge word matching and vector similarity by rank.
 
     BM25 scores and cosine similarities live on different scales, and
@@ -134,8 +185,12 @@ def search(connection: sqlite3.Connection, question: str, model: str, limit: int
     Rank fusion needs no calibration: a passage scores 1/(60 + rank) in each
     list it appears in, so appearing in both beats topping one.
     """
+    scope = scope or Scope()
     pool = max(limit * 5, 30)
-    rankings = [by_words(connection, question, pool), by_meaning(connection, question, model, pool)]
+    rankings = [
+        by_words(connection, question, pool, scope),
+        by_meaning(connection, question, model, pool, scope),
+    ]
 
     merged: dict[int, Hit] = {}
     for ranking in rankings:
@@ -168,5 +223,59 @@ def to_hit(row: sqlite3.Row, found_by: str) -> Hit:
         title=row["title"],
         heading=row["heading"],
         text=row["text"],
+        kind=row["kind"],
+        created=row["created"],
         found_by={found_by},
     )
+
+
+def note_vectors(connection: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
+    """One vector per note, averaged over its passages.
+
+    A note is not a single point, but the average is close enough to find its
+    neighbours and costs nothing extra: the passage vectors already exist.
+    """
+    rows = connection.execute(
+        "SELECT path, vector FROM chunks WHERE vector IS NOT NULL ORDER BY path"
+    ).fetchall()
+    if not rows:
+        return [], np.zeros((0, 0), dtype=np.float32)
+
+    width = len(rows[0]["vector"]) // 4
+    totals: dict[str, np.ndarray] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        vector = np.frombuffer(row["vector"], dtype=np.float32)
+        if vector.shape[0] != width:
+            continue
+        path = row["path"]
+        totals[path] = totals.get(path, np.zeros(width, dtype=np.float32)) + vector
+        counts[path] = counts.get(path, 0) + 1
+
+    paths = sorted(totals)
+    matrix = np.vstack([totals[path] / counts[path] for path in paths])
+    lengths = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return paths, matrix / np.where(lengths == 0, 1, lengths)
+
+
+def similar_notes(
+    connection: sqlite3.Connection, path: str, limit: int = 6, unlinked_only: bool = True
+) -> list[tuple[str, float]]:
+    """Notes closest to this one that it does not already link to.
+
+    Filtering out the links is what makes this useful. Surfacing neighbours the
+    author already connected tells them nothing they have not already decided.
+    """
+    paths, matrix = note_vectors(connection)
+    if path not in paths:
+        return []
+
+    scores = matrix @ matrix[paths.index(path)]
+    skip = {path}
+    if unlinked_only:
+        from brain.links import neighbours
+
+        skip |= set(neighbours(connection, path))
+
+    ranked = sorted(zip(paths, scores), key=lambda pair: -pair[1])
+    return [(other, float(score)) for other, score in ranked if other not in skip][:limit]

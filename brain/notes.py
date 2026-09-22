@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+import yaml
 
 SKIPPED_DIRECTORIES = {".obsidian", ".trash", ".git", ".github", "node_modules", "__pycache__"}
 # Below this many characters of actual words, a piece is punctuation and headings.
@@ -18,7 +20,14 @@ FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.
 FENCED_CODE = re.compile(r"^[ \t]{0,3}(```|~~~).*?^[ \t]{0,3}\1", re.DOTALL | re.MULTILINE)
 WIKILINK = re.compile(r"!?\[\[([^\[\]\n|#]+)")
 HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
-TITLE_FIELD = re.compile(r"^title:[ \t]*(.+?)[ \t]*$", re.MULTILINE)
+ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+SPELLED_DATE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\s+(\d{4})\b")
+MONTHS = {
+    name: number
+    for number, name in enumerate(
+        "jan feb mar apr may jun jul aug sep oct nov dec".split(), start=1
+    )
+}
 MARKUP_ONLY = re.compile(r"[#\-*_>`|~\s]+")
 
 
@@ -29,6 +38,10 @@ class Note:
     body: str
     links: list[str]
     digest: str
+    size: int = 0
+    kind: str = ""
+    tags: list[str] = field(default_factory=list)
+    created: str = ""
 
 
 @dataclass(frozen=True)
@@ -62,30 +75,105 @@ def find_notes(vault: Path) -> list[Path]:
 
 def read_note(path: Path, vault: Path) -> Note:
     raw = path.read_text(encoding="utf-8", errors="replace")
-    frontmatter = FRONTMATTER.match(raw)
-    body = raw[frontmatter.end():] if frontmatter else raw
+    match = FRONTMATTER.match(raw)
+    body = raw[match.end():] if match else raw
+    fields = read_frontmatter(match.group(1) if match else "")
 
     return Note(
         path=path.relative_to(vault).as_posix(),
-        title=read_title(frontmatter.group(1) if frontmatter else "", path.stem),
+        title=read_title(fields, path.stem),
         body=body,
         links=find_links(body),
         digest=hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest(),
+        size=len(raw),
+        kind=str(fields.get("type") or "").strip(),
+        tags=as_list(fields.get("tags")),
+        created=read_date(fields),
     )
 
 
-def read_title(frontmatter: str, fallback: str) -> str:
-    declared = TITLE_FIELD.search(frontmatter)
-    if not declared:
-        return fallback
-    return declared.group(1).strip().strip("\"'") or fallback
+def read_title(fields: dict, fallback: str) -> str:
+    """Notes here use `note_title`; `title` is the more common convention."""
+    for key in ("note_title", "title"):
+        declared = str(fields.get(key) or "").strip()
+        if declared:
+            return declared
+    return fallback
+
+
+def read_frontmatter(text: str) -> dict:
+    """The YAML block at the top of a note, or nothing if it will not parse.
+
+    348 of 452 notes here carry `type`, `tags` and `date_created`. That is the
+    author's own filing system, and it is worth more than anything inferred.
+    Malformed YAML is treated as absent rather than fatal: one bad note must
+    not stop the index.
+    """
+    if not text.strip():
+        return {}
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def as_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()]
+
+
+def read_date(fields: dict) -> str:
+    """An ISO date for filtering, from whichever field the note happens to use."""
+    for key in ("date_created", "created", "date"):
+        raw = str(fields.get(key, ""))
+        found = ISO_DATE.search(raw)
+        if found:
+            return found.group(0)
+        spelled = read_spelled_date(raw)
+        if spelled:
+            return spelled
+    return ""
+
+
+def read_spelled_date(raw: str) -> str:
+    """Dates written out in words, as Obsidian's template produces them.
+
+    `Thursday 26th February 2026 13:38:57` is the shape used by 165 notes in
+    this vault. Reading only ISO dates left every one of them undated and so
+    invisible to a date filter.
+
+    The month names are matched from a table rather than through strptime,
+    because %B follows the machine's locale and this has to give the same
+    answer on every device the vault is cloned to.
+    """
+    match = SPELLED_DATE.search(raw)
+    if not match:
+        return ""
+    day, month_name, year = match.groups()
+    month = MONTHS.get(month_name[:3].lower())
+    if not month:
+        return ""
+    return f"{year}-{month:02d}-{int(day):02d}"
+
+
+def date_from_name(path: str) -> str:
+    """Many notes carry their date in the filename and nowhere else."""
+    found = ISO_DATE.search(Path(path).name)
+    return found.group(0) if found else ""
 
 
 def find_links(body: str) -> list[str]:
-    """Wikilink targets, ignoring anything inside a fenced code block.
+    """Wikilink targets, once each, ignoring anything inside a fenced code block.
 
     A documented `[[placeholder]]` in a snippet is not a link between notes, and
-    letting it through puts false edges in the graph.
+    letting it through puts false edges in the graph. Repeats within one note
+    collapse to one, so a link count means "notes that link here".
     """
     without_code = FENCED_CODE.sub("", body)
     targets = (target.strip() for target in WIKILINK.findall(without_code))

@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 # Streamlit is the only dependency. It brings numpy, which is all the vector
 # maths needs at this size. Everything else is the standard library.
-dependencies = ["streamlit>=1.40"]
+dependencies = [
+    "pyyaml>=6.0.3",
+    "streamlit>=1.40",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

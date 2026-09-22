@@ -12,16 +12,33 @@ import pytest
 
 from brain import index, links, ollama
 from brain.answer import format_sources, source_budget
-from brain.search import Hit, search, to_match_query
-from brain.notes import Note, chunk_note, find_links, pack, read_note, split_to_fit
+from brain.search import Hit, Scope, search, similar_notes, to_match_query
+from brain.notes import (
+    Note,
+    chunk_note,
+    date_from_name,
+    find_links,
+    pack,
+    read_date,
+    read_frontmatter,
+    read_note,
+    split_to_fit,
+)
 
 NOTES = {
-    "Home.md": "---\ntitle: Home\n---\n\n# Home\n\nLinks to [[Thesis]] and [[Nowhere]].\n",
+    "Home.md": (
+        "---\nnote_title: Home\ntype: index\ntags:\n  - moc\n"
+        "date_created: 2026-01-05\n---\n\n# Home\n\nLinks to [[Thesis]] and [[Nowhere]].\n"
+        "Also [[Nowhere]] again.\n"
+    ),
     "work/Thesis.md": (
+        "---\ntype: research\ntags: [thesis, writing]\ndate_created: 2026-03-14\n---\n\n"
         "# Thesis\n\n## Storage decision\n\nWe picked SQLite over Qdrant.\n\n"
         "## Timeline\n\nSubmit in June.\n"
     ),
     "work/Empty.md": "",
+    "daily/2026-03-02 Standup.md": "# Standup\n\nTalked about the storage decision again.\n",
+    "work/Broken.md": "---\ntype: [unclosed\n---\n\n# Broken\n\nStill has readable text.\n",
 }
 
 
@@ -124,10 +141,11 @@ class TestIndexing:
     def test_notes_chunks_and_links_are_stored(self, indexed) -> None:
         connection, _vault = indexed
         totals = index.counts(connection)
-        assert totals["notes"] == 3
+        assert totals["notes"] == len(NOTES)
         assert totals["chunks"] > 0
-        # [[Nowhere]] points at no note, so only the Thesis edge survives.
-        assert totals["links"] == 1
+        # Home links to Thesis and twice to Nowhere. Repeats collapse per note,
+        # and the unresolved one is kept so it can be suggested.
+        assert totals["links"] == 2
 
     def test_every_chunk_gets_a_vector(self, indexed) -> None:
         connection, _vault = indexed
@@ -271,3 +289,200 @@ class TestRanking:
         hits = search(connection, "SQLite Qdrant storage decision", "stub-model", limit=5)
         assert hits
         assert all(hit.chunk_id for hit in hits)
+
+
+class TestFrontmatter:
+    """348 of 452 real notes carry type, tags and a date. That is the author's
+    own filing system, and discarding it was the biggest thing left on the table."""
+
+    def test_metadata_is_read(self, vault) -> None:
+        note = read_note(vault / "work" / "Thesis.md", vault)
+        assert note.kind == "research"
+        assert note.tags == ["thesis", "writing"]
+        assert note.created == "2026-03-14"
+
+    def test_note_title_overrides_the_filename(self, vault) -> None:
+        assert read_note(vault / "Home.md", vault).title == "Home"
+
+    def test_malformed_yaml_does_not_stop_the_note(self, vault) -> None:
+        """One unparseable note must not take the index down with it."""
+        note = read_note(vault / "work" / "Broken.md", vault)
+        assert note.kind == ""
+        assert "readable text" in note.body
+
+    def test_frontmatter_that_is_not_a_mapping_is_ignored(self) -> None:
+        assert read_frontmatter("- just\n- a list") == {}
+        assert read_frontmatter("") == {}
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2026-01-24 10:47:20", "2026-01-24"),
+            ("Thursday 26th February 2026 13:38:57", "2026-02-26"),
+            ("Tuesday 22nd July 2025 09:57:49", "2025-07-22"),
+            ("Monday 1st September 2025", "2025-09-01"),
+            ('<% tp.file.creation_date("YYYY-MM-DD") %>', ""),
+            ("3 Smurf 2026", ""),
+            ("", ""),
+        ],
+    )
+    def test_dates_written_in_words_are_read(self, raw: str, expected: str) -> None:
+        """Obsidian's template writes `Thursday 26th February 2026`. Reading only
+        ISO dates left 165 notes here undated and invisible to a date filter."""
+        assert read_date({"date_created": raw}) == expected
+
+    def test_a_date_in_the_filename_is_a_fallback(self) -> None:
+        assert date_from_name("daily/2026-03-02 Standup.md") == "2026-03-02"
+        assert date_from_name("work/Thesis.md") == ""
+
+
+class TestScope:
+    def test_no_filter_matches_everything(self) -> None:
+        assert Scope().clause() == ("1=1", [])
+        assert Scope().is_everything
+
+    def test_kinds_and_dates_combine(self) -> None:
+        where, values = Scope(kinds=("research",), since="2026-03-01", until="2026-03-31").clause()
+        assert where.count("?") == 3
+        assert values == ["research", "2026-03-01", "2026-03-31"]
+
+    def test_a_date_range_excludes_other_months(self, indexed) -> None:
+        """The failure this was built for: "March 2026" as free text matched the
+        words March and 2026 and returned January notes."""
+        connection, _vault = indexed
+        march = Scope(since="2026-03-01", until="2026-03-31")
+        hits = search(connection, "storage decision", "stub-model", limit=10, scope=march)
+        assert hits
+        assert all(hit.created.startswith("2026-03") for hit in hits)
+
+    def test_filtering_by_kind_excludes_other_kinds(self, indexed) -> None:
+        connection, _vault = indexed
+        hits = search(connection, "storage", "stub-model", limit=10, scope=Scope(kinds=("index",)))
+        assert all(hit.kind == "index" for hit in hits)
+
+
+class TestSuggestions:
+    def test_links_pointing_nowhere_are_kept_and_counted(self, indexed) -> None:
+        """A concept linked repeatedly and never written is the clearest signal
+        in the vault about what to write next, so the edge is stored, not dropped."""
+        connection, _vault = indexed
+        assert links.unwritten(connection, least_links=1) == [("Nowhere", 1)]
+
+    def test_the_count_is_notes_not_mentions(self, indexed) -> None:
+        """Home links to [[Nowhere]] twice. That is one note reaching for it."""
+        connection, vault = indexed
+        (vault / "Second.md").write_text("Also [[Nowhere]].\n", encoding="utf-8")
+        index.refresh(connection, vault, "stub-model")
+        assert links.unwritten(connection, least_links=2) == [("Nowhere", 2)]
+
+    def test_a_link_that_resolves_is_not_suggested(self, indexed) -> None:
+        connection, _vault = indexed
+        assert all(name != "Thesis" for name, _count in links.unwritten(connection, 1))
+
+    def test_stubs_are_the_nearly_empty_notes(self, indexed) -> None:
+        connection, _vault = indexed
+        assert any(path == "work/Empty.md" for path, _size in links.stubs(connection))
+
+    def test_kinds_are_counted_from_frontmatter(self, indexed) -> None:
+        connection, _vault = indexed
+        assert dict(links.kinds(connection))["research"] == 1
+
+    def test_date_range_spans_the_vault(self, indexed) -> None:
+        connection, _vault = indexed
+        first, last = links.date_range(connection)
+        assert first == "2026-01-05"
+        assert last == "2026-03-14"
+
+
+class TestRelatedNotes:
+    def test_a_note_already_linked_is_not_suggested(self, indexed) -> None:
+        """Surfacing a neighbour the author already connected tells them nothing."""
+        connection, _vault = indexed
+        suggested = {path for path, _score in similar_notes(connection, "Home.md")}
+        assert "work/Thesis.md" not in suggested
+
+    def test_the_note_itself_is_never_suggested(self, indexed) -> None:
+        connection, _vault = indexed
+        assert all(path != "Home.md" for path, _ in similar_notes(connection, "Home.md"))
+
+    def test_an_unknown_path_gives_nothing(self, indexed) -> None:
+        connection, _vault = indexed
+        assert similar_notes(connection, "does/not/exist.md") == []
+
+
+class TestThemes:
+    def test_clustering_recovers_separated_groups(self) -> None:
+        import numpy as np
+
+        from brain.themes import cluster
+
+        generator = np.random.default_rng(1)
+        blobs = np.vstack(
+            [generator.normal(centre, 0.05, size=(30, 8)) for centre in np.eye(3, 8)]
+        )
+        blobs /= np.linalg.norm(blobs, axis=1, keepdims=True)
+        labels = cluster(blobs, 3)
+        groups = [set(labels[start: start + 30]) for start in (0, 30, 60)]
+        assert all(len(group) == 1 for group in groups)
+        assert len({group.pop() for group in groups}) == 3
+
+    def test_repeated_names_are_separated(self) -> None:
+        from brain.themes import Theme, make_names_distinct
+
+        found = make_names_distinct(
+            [Theme("Daily Notes", ["Daily/a.md"]), Theme("Daily Notes", ["Personal/b.md"])]
+        )
+        assert found[0].name != found[1].name
+
+    def test_too_few_notes_to_cluster_yields_nothing(self, indexed) -> None:
+        from brain.themes import find_themes
+
+        connection, _vault = indexed
+        assert find_themes(connection, "stub-model", count=50) == []
+
+
+class TestInterruptedIndexing:
+    def test_links_survive_a_failure_while_embedding(self, vault, tmp_path, monkeypatch) -> None:
+        """Embedding takes 90 seconds on this vault and can be interrupted.
+
+        Links are unrelated to vectors, so they must already be on disk when
+        that happens. Writing them afterwards left the graph blank.
+        """
+        def fail(texts, model):
+            raise ollama.OllamaError("Ollama went away")
+
+        monkeypatch.setattr(ollama, "embed_documents", fail)
+        connection = index.connect(tmp_path / "index.db")
+        with pytest.raises(ollama.OllamaError):
+            index.refresh(connection, vault, "stub-model")
+
+        assert index.counts(connection)["links"] > 0
+        assert links.backlinks(connection, "work/Thesis.md") == ["Home.md"]
+        connection.close()
+
+    def test_the_next_run_fills_the_missing_vectors(self, vault, tmp_path, monkeypatch) -> None:
+        """The passages are already written, so only the gaps need embedding."""
+        calls = []
+
+        def fail(texts, model):
+            raise ollama.OllamaError("Ollama went away")
+
+        monkeypatch.setattr(ollama, "embed_documents", fail)
+        connection = index.connect(tmp_path / "index.db")
+        with pytest.raises(ollama.OllamaError):
+            index.refresh(connection, vault, "stub-model")
+        written = index.counts(connection)["chunks"]
+
+        def succeed(texts, model):
+            calls.append(len(texts))
+            return [[1.0, 0.0, 0.0]] * len(texts)
+
+        monkeypatch.setattr(ollama, "embed_documents", succeed)
+        index.refresh(connection, vault, "stub-model")
+
+        assert index.counts(connection)["chunks"] == written
+        missing = connection.execute(
+            "SELECT COUNT(*) AS total FROM chunks WHERE vector IS NULL"
+        ).fetchone()["total"]
+        assert missing == 0
+        connection.close()

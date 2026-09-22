@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from collections.abc import Callable
@@ -12,16 +13,32 @@ from pathlib import Path
 import numpy as np
 
 from brain import ollama
-from brain.notes import Note, chunk_note, embedding_text, find_notes, read_note
+from brain.notes import (
+    Note,
+    chunk_note,
+    date_from_name,
+    embedding_text,
+    find_notes,
+    read_note,
+)
 
-SCHEMA_VERSION = "1"
+# Bump this when the tables change, and also when the parser starts reading
+# something it did not before. A note's digest is of its file, so a parser
+# change alone leaves every digest matching and the refresh skips the lot.
+SCHEMA_VERSION = "3"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
-    path   TEXT PRIMARY KEY,
-    title  TEXT NOT NULL,
-    digest TEXT NOT NULL
+    path    TEXT PRIMARY KEY,
+    title   TEXT NOT NULL,
+    digest  TEXT NOT NULL,
+    size    INTEGER NOT NULL DEFAULT 0,
+    kind    TEXT NOT NULL DEFAULT '',
+    tags    TEXT NOT NULL DEFAULT '[]',
+    created TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS notes_by_kind ON notes(kind);
+CREATE INDEX IF NOT EXISTS notes_by_created ON notes(created);
 
 CREATE TABLE IF NOT EXISTS chunks (
     id      INTEGER PRIMARY KEY,
@@ -47,7 +64,8 @@ END;
 
 CREATE TABLE IF NOT EXISTS links (
     source TEXT NOT NULL,
-    target TEXT NOT NULL
+    target TEXT,
+    raw    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS links_by_target ON links(target);
 CREATE INDEX IF NOT EXISTS links_by_source ON links(source);
@@ -183,8 +201,13 @@ def refresh(
         announce("reading notes", position, len(changed))
         report.chunks += store_note(connection, note)
 
-    embed_missing(connection, model, announce)
+    # Links are written before the slow step. They cost milliseconds and do not
+    # depend on any vector, so doing them last meant an interrupted embed left
+    # the table emptied and not refilled, and the graph blank until the next run.
     rewrite_links(connection, notes)
+    connection.commit()
+
+    embed_missing(connection, model, announce)
     write_meta(connection, "embedding_model", model)
     write_meta(connection, "vault_fingerprint", vault_fingerprint(vault))
     write_meta(connection, "indexed_at", time.time())
@@ -198,8 +221,17 @@ def store_note(connection: sqlite3.Connection, note: Note) -> int:
     """Write the note and its passages, leaving the vectors for the batch pass."""
     connection.execute("DELETE FROM notes WHERE path = ?", (note.path,))
     connection.execute(
-        "INSERT INTO notes(path, title, digest) VALUES (?, ?, ?)",
-        (note.path, note.title, note.digest),
+        "INSERT INTO notes(path, title, digest, size, kind, tags, created) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            note.path,
+            note.title,
+            note.digest,
+            note.size,
+            note.kind,
+            json.dumps(note.tags),
+            note.created or date_from_name(note.path),
+        ),
     )
 
     chunks = chunk_note(note)
@@ -251,12 +283,15 @@ def rewrite_links(connection: sqlite3.Connection, notes: list[Note]) -> None:
         by_name.setdefault(link_key(Path(note.path).stem), note.path)
         by_name.setdefault(link_key(note.path), note.path)
 
-    edges: set[tuple[str, str]] = set()
+    edges: set[tuple[str, str | None, str]] = set()
     for note in notes:
         edges |= edges_from(note, by_name)
 
     connection.execute("DELETE FROM links")
-    connection.executemany("INSERT INTO links(source, target) VALUES (?, ?)", sorted(edges))
+    connection.executemany(
+        "INSERT INTO links(source, target, raw) VALUES (?, ?, ?)",
+        sorted(edges, key=lambda edge: (edge[0], edge[2])),
+    )
 
 
 def link_key(name: str) -> str:
@@ -264,13 +299,19 @@ def link_key(name: str) -> str:
     return name.lower().removesuffix(".md")
 
 
-def edges_from(note: Note, by_name: dict[str, str]) -> set[tuple[str, str]]:
-    destinations = (by_name.get(link_key(target)) for target in note.links)
-    return {
-        (note.path, destination)
-        for destination in destinations
-        if destination and destination != note.path
-    }
+def edges_from(note: Note, by_name: dict[str, str]) -> set[tuple[str, str | None, str]]:
+    """Every link out of a note, including the ones pointing at nothing.
+
+    An unresolved link is kept with a null target because it is a signal, not
+    an error: a concept linked eight times and never written is worth knowing.
+    """
+    found = set()
+    for target in note.links:
+        destination = by_name.get(link_key(target))
+        if destination == note.path:
+            continue
+        found.add((note.path, destination, target))
+    return found
 
 
 def pack(vector: list[float]) -> bytes:
