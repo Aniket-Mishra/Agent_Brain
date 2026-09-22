@@ -1,0 +1,76 @@
+"""The chat tab: ask a question, stream the answer, show what it came from."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import streamlit as st
+
+from brain import ollama
+from brain.answer import NOTHING_FOUND, build_messages, source_budget
+from brain.search import search
+
+
+def render(
+    connection: sqlite3.Connection,
+    chat_model: str,
+    embedding_model: str,
+    passages: int,
+    context_size: int,
+) -> None:
+    history = st.session_state.setdefault("history", [])
+
+    for turn in history:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["text"])
+            if turn.get("sources"):
+                show_sources(turn["sources"])
+
+    question = st.chat_input("Ask your vault something")
+    if not question:
+        return
+
+    history.append({"role": "user", "text": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        try:
+            with st.spinner("Searching your notes"):
+                hits = search(connection, question, embedding_model, limit=passages)
+        except ollama.OllamaError as error:
+            st.error(str(error))
+            return
+
+        if not hits:
+            st.markdown(NOTHING_FOUND)
+            history.append({"role": "assistant", "text": NOTHING_FOUND})
+            return
+
+        messages = build_messages(question, hits, source_budget(context_size))
+        try:
+            answer = st.write_stream(ollama.stream_reply(messages, chat_model, context_size))
+        except ollama.OllamaError as error:
+            st.error(str(error))
+            return
+
+        sources = [
+            {"path": hit.path, "heading": hit.heading, "text": hit.text,
+             "found_by": ", ".join(sorted(hit.found_by))}
+            for hit in hits
+        ]
+        show_sources(sources)
+
+    history.append({"role": "assistant", "text": answer, "sources": sources})
+
+
+def show_sources(sources: list[dict]) -> None:
+    with st.expander(f"{len(sources)} sources"):
+        for number, source in enumerate(sources, start=1):
+            label = Path(source["path"]).stem
+            if source["heading"]:
+                label += f"  ·  {source['heading']}"
+            st.markdown(f"**[{number}] {label}**")
+            st.caption(f"{source['path']}  ·  found by {source['found_by']}")
+            st.text(source["text"][:1500])

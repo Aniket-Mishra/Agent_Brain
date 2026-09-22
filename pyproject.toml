@@ -1,0 +1,19 @@
+[project]
+name = "agent-brain"
+version = "0.1.0"
+description = "Chat with an Obsidian vault using local models. Nothing leaves the machine."
+readme = "README.md"
+requires-python = ">=3.12"
+# Streamlit is the only dependency. It brings numpy, which is all the vector
+# maths needs at this size. Everything else is the standard library.
+dependencies = ["streamlit>=1.40"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# This is an app run with `streamlit run app.py`, not an installed package, so
+# the modules are imported from the repository root rather than site-packages.
+pythonpath = ["."]
