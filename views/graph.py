@@ -7,22 +7,20 @@ from pathlib import Path
 
 import streamlit as st
 
-from brain import links
+from brain import index, links
 
 
 def render(connection: sqlite3.Connection) -> None:
-    paths = [row["path"] for row in connection.execute("SELECT path FROM notes ORDER BY path")]
+    paths = index.all_paths(connection)
     if not paths:
         st.info("Nothing indexed yet.")
         return
 
-    linked = [path for path, _count in links.most_linked(connection, limit=len(paths))]
-    ordered = linked + [path for path in paths if path not in linked]
-
+    ordered = most_linked_first(connection, paths)
     chosen = st.session_state.get("selected_note")
     start = ordered.index(chosen) if chosen in ordered else 0
 
-    controls, _spacer = st.columns([3, 1])
+    controls = st.columns([3, 1])[0]
     with controls:
         focus = st.selectbox(
             "Centre on", ordered, index=start, format_func=lambda path: Path(path).stem
@@ -42,3 +40,10 @@ def render(connection: sqlite3.Connection) -> None:
 
     if st.button(f"Open {Path(focus).stem} in Browse"):
         st.session_state["selected_note"] = focus
+
+
+def most_linked_first(connection: sqlite3.Connection, paths: list[str]) -> list[str]:
+    """Busiest notes at the top of the picker, since those are worth looking at."""
+    linked = [path for path, _count in links.most_linked(connection, limit=len(paths))]
+    already = set(linked)
+    return linked + [path for path in paths if path not in already]

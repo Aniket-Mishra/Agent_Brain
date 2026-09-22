@@ -21,9 +21,10 @@ NOTHING_FOUND = (
 
 
 def build_messages(question: str, hits: list[Hit], budget: int) -> list[dict[str, str]]:
+    sources = format_sources(hits, budget)
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Sources:\n\n{format_sources(hits, budget)}\n\nQuestion: {question}"},
+        {"role": "user", "content": f"Sources:\n\n{sources}\n\nQuestion: {question}"},
     ]
 
 

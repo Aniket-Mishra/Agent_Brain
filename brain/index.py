@@ -82,14 +82,19 @@ def connect(database: Path) -> sqlite3.Connection:
 
 
 def read_schema_version(database: Path) -> str | None:
+    # `with sqlite3.connect(...)` opens a transaction, not a closing scope, so
+    # the connection has to be closed by hand or it leaks on every call.
     try:
-        with sqlite3.connect(database) as probe:
-            row = probe.execute(
-                "SELECT value FROM meta WHERE key = 'schema_version'"
-            ).fetchone()
-            return row[0] if row else None
+        probe = sqlite3.connect(database)
     except sqlite3.DatabaseError:
         return None
+    try:
+        row = probe.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        return row[0] if row else None
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        probe.close()
 
 
 def discard(database: Path) -> None:
@@ -157,7 +162,10 @@ def refresh(
         connection.execute("DELETE FROM notes")
         report.rebuilt = True
 
-    known = {row["path"]: row["digest"] for row in connection.execute("SELECT path, digest FROM notes")}
+    known = {
+        row["path"]: row["digest"]
+        for row in connection.execute("SELECT path, digest FROM notes")
+    }
     announce("reading notes", 0, 1)
     notes = [read_note(path, vault) for path in find_notes(vault)]
     on_disk = {note.path: note for note in notes}
@@ -240,19 +248,29 @@ def rewrite_links(connection: sqlite3.Connection, notes: list[Note]) -> None:
     """
     by_name: dict[str, str] = {}
     for note in notes:
-        by_name.setdefault(Path(note.path).stem.lower(), note.path)
-        by_name.setdefault(note.path.lower(), note.path)
-        by_name.setdefault(note.path.lower().removesuffix(".md"), note.path)
+        by_name.setdefault(link_key(Path(note.path).stem), note.path)
+        by_name.setdefault(link_key(note.path), note.path)
 
-    edges = {
-        (note.path, by_name[target.lower().removesuffix(".md")])
-        for note in notes
-        for target in note.links
-        if target.lower().removesuffix(".md") in by_name
-        and by_name[target.lower().removesuffix(".md")] != note.path
-    }
+    edges: set[tuple[str, str]] = set()
+    for note in notes:
+        edges |= edges_from(note, by_name)
+
     connection.execute("DELETE FROM links")
     connection.executemany("INSERT INTO links(source, target) VALUES (?, ?)", sorted(edges))
+
+
+def link_key(name: str) -> str:
+    """How a link target and a note name are compared: lower case, no extension."""
+    return name.lower().removesuffix(".md")
+
+
+def edges_from(note: Note, by_name: dict[str, str]) -> set[tuple[str, str]]:
+    destinations = (by_name.get(link_key(target)) for target in note.links)
+    return {
+        (note.path, destination)
+        for destination in destinations
+        if destination and destination != note.path
+    }
 
 
 def pack(vector: list[float]) -> bytes:
@@ -262,8 +280,21 @@ def pack(vector: list[float]) -> bytes:
     return (array if length == 0 else array / length).tobytes()
 
 
+def all_paths(connection: sqlite3.Connection) -> list[str]:
+    """Every indexed note, for the pickers in the UI."""
+    return [row["path"] for row in connection.execute("SELECT path FROM notes ORDER BY path")]
+
+
 def counts(connection: sqlite3.Connection) -> dict[str, int]:
+    # The table names are literals from the tuple below, never user input.
     return {
         name: connection.execute(f"SELECT COUNT(*) AS total FROM {name}").fetchone()["total"]
         for name in ("notes", "chunks", "links")
     }
+
+
+def clear(connection: sqlite3.Connection) -> None:
+    """Drop everything derived from the vault so the next launch rebuilds it."""
+    connection.execute("DELETE FROM notes")
+    connection.execute("DELETE FROM meta WHERE key = 'vault_fingerprint'")
+    connection.commit()

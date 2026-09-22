@@ -7,11 +7,11 @@ from pathlib import Path
 
 import streamlit as st
 
-from brain import links
+from brain import index, links
 
 
 def render(connection: sqlite3.Connection, vault: Path) -> None:
-    paths = [row["path"] for row in connection.execute("SELECT path FROM notes ORDER BY path")]
+    paths = index.all_paths(connection)
     if not paths:
         st.info("Nothing indexed yet.")
         return

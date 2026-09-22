@@ -9,7 +9,7 @@ import streamlit as st
 
 from brain import ollama
 from brain.answer import NOTHING_FOUND, build_messages, source_budget
-from brain.search import search
+from brain.search import Hit, search
 
 
 def render(
@@ -39,38 +39,26 @@ def render(
         try:
             with st.spinner("Searching your notes"):
                 hits = search(connection, question, embedding_model, limit=passages)
-        except ollama.OllamaError as error:
-            st.error(str(error))
-            return
-
-        if not hits:
-            st.markdown(NOTHING_FOUND)
-            history.append({"role": "assistant", "text": NOTHING_FOUND})
-            return
-
-        messages = build_messages(question, hits, source_budget(context_size))
-        try:
+            if not hits:
+                st.markdown(NOTHING_FOUND)
+                history.append({"role": "assistant", "text": NOTHING_FOUND})
+                return
+            messages = build_messages(question, hits, source_budget(context_size))
             answer = st.write_stream(ollama.stream_reply(messages, chat_model, context_size))
         except ollama.OllamaError as error:
             st.error(str(error))
             return
+        show_sources(hits)
 
-        sources = [
-            {"path": hit.path, "heading": hit.heading, "text": hit.text,
-             "found_by": ", ".join(sorted(hit.found_by))}
-            for hit in hits
-        ]
-        show_sources(sources)
-
-    history.append({"role": "assistant", "text": answer, "sources": sources})
+    history.append({"role": "assistant", "text": answer, "sources": hits})
 
 
-def show_sources(sources: list[dict]) -> None:
-    with st.expander(f"{len(sources)} sources"):
-        for number, source in enumerate(sources, start=1):
-            label = Path(source["path"]).stem
-            if source["heading"]:
-                label += f"  ·  {source['heading']}"
+def show_sources(hits: list[Hit]) -> None:
+    with st.expander(f"{len(hits)} sources"):
+        for number, hit in enumerate(hits, start=1):
+            label = Path(hit.path).stem
+            if hit.heading:
+                label += f"  ·  {hit.heading}"
             st.markdown(f"**[{number}] {label}**")
-            st.caption(f"{source['path']}  ·  found by {source['found_by']}")
-            st.text(source["text"][:1500])
+            st.caption(f"{hit.path}  ·  found by {', '.join(sorted(hit.found_by))}")
+            st.text(hit.text[:1500])

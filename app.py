@@ -47,9 +47,10 @@ def main() -> None:
     # are only correct after any re-index below has finished.
     summary = st.sidebar.container()
 
-    embedding_model = pick_model(models, EMBEDDING_HINTS, "Embedding model", "embedding_model")
-    chat_model = pick_model(models, (), "Chat model", "chat_model", avoid=EMBEDDING_HINTS)
-    passages, context_size = show_tuning(connection, vault)
+    embedding_models, chat_models = split_models(models)
+    embedding_model = st.sidebar.selectbox("Embedding model", embedding_models, key="embedding")
+    chat_model = st.sidebar.selectbox("Chat model", chat_models, key="chat")
+    passages, context_size = show_settings(vault)
 
     keep_index_current(connection, vault, embedding_model)
     with summary:
@@ -90,22 +91,15 @@ def resolve_vault() -> Path | None:
     return None
 
 
-def pick_model(
-    models: list[str], hints: tuple[str, ...], label: str, key: str, avoid: tuple[str, ...] = ()
-) -> str:
-    """Offer only models Ollama already has, defaulting to a sensible one."""
-    preferred = [name for name in models if matches(name, hints, avoid)] or models
-    remembered = st.session_state.get(key)
-    start = preferred.index(remembered) if remembered in preferred else 0
-    chosen = st.sidebar.selectbox(label, preferred, index=start, key=key)
-    return chosen
+def split_models(models: list[str]) -> tuple[list[str], list[str]]:
+    """Separate embedding models from chat models.
 
-
-def matches(name: str, hints: tuple[str, ...], avoid: tuple[str, ...]) -> bool:
-    lowered = name.lower()
-    if any(word in lowered for word in avoid):
-        return False
-    return not hints or any(word in lowered for word in hints)
+    Ollama does not say which is which, so the name is the only signal. If the
+    guess comes up empty, offer everything rather than an empty dropdown.
+    """
+    embedding = [name for name in models if any(hint in name.lower() for hint in EMBEDDING_HINTS)]
+    chatting = [name for name in models if name not in set(embedding)]
+    return embedding or models, chatting or models
 
 
 def keep_index_current(connection: sqlite3.Connection, vault: Path, embedding_model: str) -> None:
@@ -141,10 +135,13 @@ def show_summary(connection: sqlite3.Connection, vault: Path) -> None:
     totals = index.counts(connection)
     st.markdown(f"### {vault.name}")
     st.caption(f"{totals['notes']} notes · {totals['chunks']} passages · {totals['links']} links")
+    if st.button("Rebuild index", use_container_width=True):
+        index.clear(connection)
+        st.rerun()
     st.divider()
 
 
-def show_tuning(connection: sqlite3.Connection, vault: Path) -> tuple[int, int]:
+def show_settings(vault: Path) -> tuple[int, int]:
     """Settings worth changing rarely, kept out of the way."""
     with st.sidebar.expander("Settings"):
         passages = st.slider("Passages in context", 3, 15, 8)
@@ -153,11 +150,6 @@ def show_tuning(connection: sqlite3.Connection, vault: Path) -> tuple[int, int]:
         )
         st.caption(f"Vault: `{vault}`")
         st.caption(f"Index: `{database_path(vault)}`")
-        if st.button("Rebuild index from scratch", use_container_width=True):
-            connection.execute("DELETE FROM notes")
-            connection.execute("DELETE FROM meta WHERE key = 'vault_fingerprint'")
-            connection.commit()
-            st.rerun()
     return passages, context_size
 
 

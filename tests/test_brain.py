@@ -111,7 +111,9 @@ class TestSearchQuery:
         """Stopwords go, unless dropping them would leave nothing to search for."""
         assert to_match_query(question) == expected
 
-    @pytest.mark.parametrize("question", ["a AND b", "col:value", "star*", '"unbalanced', "!!! ???"])
+    @pytest.mark.parametrize(
+        "question", ["a AND b", "col:value", "star*", '"unbalanced', "!!! ???"]
+    )
     def test_fts_operators_never_reach_sqlite(self, question: str, indexed) -> None:
         """A raw question containing FTS syntax must not raise."""
         connection, _vault = indexed
@@ -206,14 +208,16 @@ class TestPrompt:
         assert source_budget(512) >= 1000
 
     def test_sources_are_numbered_and_stop_at_the_budget(self) -> None:
-        hits = [Hit(f"{number}.md", str(number), "", "x" * 500) for number in range(20)]
+        hits = [Hit(number, f"{number}.md", str(number), "", "x" * 500) for number in range(20)]
         text = format_sources(hits, budget=1200)
         assert text.startswith("[1] 0.md")
         assert len(text) < 2200
 
 
 class TestSchemaChanges:
-    def test_an_old_index_is_rebuilt_rather_than_crashing(self, tmp_path, vault, monkeypatch) -> None:
+    def test_an_old_index_is_rebuilt_rather_than_crashing(
+        self, tmp_path, vault, monkeypatch
+    ) -> None:
         """Pulling a version with a different table shape must not crash.
 
         The index is derived from the vault, so it gets thrown away and rebuilt.
@@ -241,3 +245,29 @@ class TestSchemaChanges:
         connection = index.connect(database)
         assert index.counts(connection)["notes"] == 0
         connection.close()
+
+
+class TestRanking:
+    def test_two_passages_with_the_same_opening_stay_separate(self, indexed) -> None:
+        """Identity is the passage id. Keying on a text prefix merged any two
+        passages from one note that happened to start the same way."""
+        from brain.search import Hit, limit_per_note
+
+        shared_opening = "The same first eighty characters repeated here for both of them."
+        hits = [
+            Hit(1, "a.md", "A", "", shared_opening + " one"),
+            Hit(2, "a.md", "A", "", shared_opening + " two"),
+        ]
+        assert len(limit_per_note(hits, allowed=2)) == 2
+
+    def test_one_note_cannot_fill_the_answer(self) -> None:
+        from brain.search import Hit, limit_per_note
+
+        hits = [Hit(number, "same.md", "S", "", "text") for number in range(6)]
+        assert len(limit_per_note(hits, allowed=2)) == 2
+
+    def test_appearing_in_both_rankings_beats_topping_one(self, indexed) -> None:
+        connection, _vault = indexed
+        hits = search(connection, "SQLite Qdrant storage decision", "stub-model", limit=5)
+        assert hits
+        assert all(hit.chunk_id for hit in hits)

@@ -29,6 +29,7 @@ NON_WORD = re.compile(r"[^\w/-]+", re.UNICODE)
 
 @dataclass
 class Hit:
+    chunk_id: int
     path: str
     title: str
     heading: str
@@ -72,22 +73,23 @@ def by_words(connection: sqlite3.Connection, question: str, limit: int) -> list[
         return []
     rows = connection.execute(
         """
-        SELECT chunks.path, chunks.heading, chunks.text, notes.title
+        SELECT chunks.id
         FROM chunks_fts
         JOIN chunks ON chunks.id = chunks_fts.rowid
-        JOIN notes ON notes.path = chunks.path
         WHERE chunks_fts MATCH ?
         ORDER BY bm25(chunks_fts, 1.0, 0.5) LIMIT ?
         """,
         (match, limit),
     ).fetchall()
-    return [to_hit(row, "words") for row in rows]
+    return load_hits(connection, [row["id"] for row in rows], "words")
 
 
 def by_meaning(connection: sqlite3.Connection, question: str, model: str, limit: int) -> list[Hit]:
+    # Ranking needs only the vectors, so the text is fetched afterwards for the
+    # few that survive. This is not measurably faster at 2,600 passages, it just
+    # keeps both retrievers producing ids and leaves one place that builds Hits.
     rows = connection.execute(
-        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, chunks.vector, notes.title "
-        "FROM chunks JOIN notes ON notes.path = chunks.path WHERE chunks.vector IS NOT NULL"
+        "SELECT id, vector FROM chunks WHERE vector IS NOT NULL"
     ).fetchall()
     if not rows:
         return []
@@ -102,12 +104,26 @@ def by_meaning(connection: sqlite3.Connection, question: str, model: str, limit:
     if matrix.shape[1] != question_vector.shape[0]:
         return []
 
-    # ponytail: brute force over every vector. At 2,600 chunks this is a 8 MB
+    # ponytail: brute force over every vector. At 2,600 passages this is an 8 MB
     # dot product taking a few milliseconds, and it is exact. Revisit above
-    # roughly 100,000 chunks, where an approximate index starts to earn its keep.
+    # roughly 100,000 passages, where an approximate index starts to earn its keep.
     scores = matrix @ question_vector
     best = np.argsort(-scores)[:limit]
-    return [to_hit(rows[position], "meaning") for position in best]
+    return load_hits(connection, [rows[position]["id"] for position in best], "meaning")
+
+
+def load_hits(connection: sqlite3.Connection, chunk_ids: list[int], found_by: str) -> list[Hit]:
+    """Fetch the passages for a ranked list of ids, keeping that order."""
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" * len(chunk_ids))
+    rows = connection.execute(
+        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, notes.title "
+        f"FROM chunks JOIN notes ON notes.path = chunks.path WHERE chunks.id IN ({placeholders})",
+        chunk_ids,
+    ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    return [to_hit(by_id[chunk_id], found_by) for chunk_id in chunk_ids if chunk_id in by_id]
 
 
 def search(connection: sqlite3.Connection, question: str, model: str, limit: int = 8) -> list[Hit]:
@@ -121,11 +137,10 @@ def search(connection: sqlite3.Connection, question: str, model: str, limit: int
     pool = max(limit * 5, 30)
     rankings = [by_words(connection, question, pool), by_meaning(connection, question, model, pool)]
 
-    merged: dict[tuple[str, str], Hit] = {}
+    merged: dict[int, Hit] = {}
     for ranking in rankings:
         for rank, hit in enumerate(ranking, start=1):
-            key = (hit.path, hit.text[:80])
-            existing = merged.setdefault(key, hit)
+            existing = merged.setdefault(hit.chunk_id, hit)
             existing.score += 1 / (60 + rank)
             existing.found_by |= hit.found_by
 
@@ -138,15 +153,17 @@ def limit_per_note(hits: list[Hit], allowed: int) -> list[Hit]:
     seen: dict[str, int] = {}
     kept = []
     for hit in hits:
-        if seen.get(hit.path, 0) >= allowed:
+        taken = seen.get(hit.path, 0)
+        if taken >= allowed:
             continue
-        seen[hit.path] = seen.get(hit.path, 0) + 1
+        seen[hit.path] = taken + 1
         kept.append(hit)
     return kept
 
 
 def to_hit(row: sqlite3.Row, found_by: str) -> Hit:
     return Hit(
+        chunk_id=row["id"],
         path=row["path"],
         title=row["title"],
         heading=row["heading"],

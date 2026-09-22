@@ -92,10 +92,8 @@ def to_dot(nodes: set[str], edges: set[tuple[str, str]], focus: str) -> str:
     ]
     for note in sorted(nodes):
         label = escape(Path(note).stem)
-        if note == focus:
-            lines.append(f'  "{escape(note)}" [label="{label}" fillcolor="#ffd9d0" color="#ff4b4b"];')
-        else:
-            lines.append(f'  "{escape(note)}" [label="{label}"];')
+        highlight = ' fillcolor="#ffd9d0" color="#ff4b4b"' if note == focus else ""
+        lines.append(f'  "{escape(note)}" [label="{label}"{highlight}];')
     for source, target in sorted(edges):
         lines.append(f'  "{escape(source)}" -> "{escape(target)}";')
     lines.append("}")
