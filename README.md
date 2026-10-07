@@ -1,12 +1,25 @@
 # Agent Brain
 
-Chat with your Obsidian vault using local models. Your notes never leave the machine.
+Read-only tools and chat for an Obsidian vault. Local Ollama powers hybrid search.
 
-Two dependencies, one SQLite file, two commands to run.
+One SQLite cache serves the Streamlit app and shell commands, with Search chat as the
+default. Experimental exploration reads additional passages and follows links; it can
+also search again.
 
 ## Setup
 
 You need [Ollama](https://ollama.com) and [uv](https://docs.astral.sh/uv/).
+
+Run Ollama with cloud features disabled. For a foreground server in a separate terminal:
+
+```bash
+OLLAMA_NO_CLOUD=1 ollama serve
+```
+
+For the Ollama desktop app, set its local-only server setting and restart it as described
+in the [Ollama FAQ](https://docs.ollama.com/faq). The client requires a loopback endpoint,
+rejects advertised cloud models, and bypasses HTTP proxies and redirects; server
+configuration still matters because the client cannot certify an arbitrary local proxy.
 
 ```bash
 ollama pull nomic-embed-text   # 274 MB, for search
@@ -16,12 +29,14 @@ ollama pull qwen3:4b           # 2.5 GB, for answers
 Then, from this folder:
 
 ```bash
-uv sync
-uv run streamlit run app.py
+uv sync --locked
+uv run streamlit run app.py --server.address 127.0.0.1 --browser.gatherUsageStats false
 ```
 
-The first launch reads your vault and builds the index. After that it starts instantly and
-only re-reads notes you changed.
+The first launch reads your vault and builds the index; later launches check freshness and
+re-embed changed notes. An older cache rebuilds derived rows once to remove ambiguous
+embedding provenance; a model change, including a digest change under the same tag, also
+rebuilds the cache. Vault files remain untouched.
 
 ## Using it on another device
 
@@ -38,14 +53,66 @@ The vault is found by looking for a folder containing `.obsidian`: first
 of this repo, then any parent of where you ran the command. If two vaults sit side by side it
 asks rather than guessing, and remembers your answer.
 
+An explicit invalid `AGENT_BRAIN_VAULT` stops resolution; correct that setting rather than
+silently opening a different vault. Notes resolving outside the vault are rejected;
+external file symlinks are excluded from ingestion.
+
 The index is never committed. It lives in `~/.cache/agent_brain/`, one file per vault, because
 it holds your note text and both repos have remotes. Each device builds its own in about a
 minute.
 
+`XDG_CACHE_HOME` can relocate the cache, whose resolved location must stay outside the vault.
+Use one active refresh at a time, avoiding rebuilds while another app or CLI command
+refreshes the same vault; SQLite's busy timeout is not a refresh scheduler.
+
+## Shell commands
+
+Point the commands at a vault containing `.obsidian`:
+
+```bash
+export AGENT_BRAIN_VAULT=/path/to/Obsidian_Vault
+uv run python ask.py search "storage decision"
+uv run python ask.py read "work/Thesis.md"
+uv run python ask.py backlinks "work/Thesis.md"
+uv run python ask.py related "work/Thesis.md"
+uv run python ask.py survey
+uv run python ask.py ask "Which storage engine did I choose?"
+```
+
+The five deterministic commands return passages or index facts without a chat model.
+Search embeds the query; related needs current vectors.
+
+Every command refreshes a stale index, which can require Ollama. A current cache supports
+`read`, `backlinks`, and `survey`
+with Ollama stopped. `read` returns indexed passages with headings, not the complete
+original Markdown file; very short sections may be absent and long reads are truncated.
+
+All commands accept `--embed`, repeated `--kind`, and `--since` / `--until` in `YYYY-MM-DD`.
+Search and ask accept `--passages` from 3 to 15; ask also accepts `--model`, `--context`
+(4096, 8192, 16384, or 32768), and paired `--prior-user` / `--prior-assistant` values.
+Filtered CLI calls discard that text-only prior pair; its original scope is unknown.
+
+Ask defaults to four chat calls, eight tool attempts, 800 generated tokens per call, and
+a 120-second chat timeout. Override these with `--max-calls`, `--max-tools`, `--max-tokens`,
+and `--timeout`; `--max-tokens` takes a positive integer. Execution and context limits
+produce a labeled incomplete result.
+
+Answers use `[E1]` passage identifiers and `[I1]` computed index identifiers; the output
+maps each identifier to retrieved evidence and marks cited items. Unseen or missing
+citations fail validation. A known identifier proves that evidence was retrieved;
+inspect the passage to judge whether it supports the claim.
+
+Stdout contains results; stderr contains progress and errors. Success, including an
+explicit insufficient-evidence or limit result, exits 0; model/index failures exit 1;
+invalid invocations exit 2. `uv run python ask.py --help` lists commands.
+
 ## What it does
 
-**Chat.** Ask a question, get an answer with the notes it came from. Every source shows its
-path, heading, type and date, and whether words or meaning found it.
+**Chat.** Ask a question to get an answer alongside retrieved notes; every source shows its
+path, heading, type and date, and whether words or meaning found it. Enable **Explore notes
+with tools (experimental)** to use the bounded loop. It keeps one good prior exchange for
+reference resolution, retrieving supporting facts again; a vault or scope change clears
+the prior pair. Error and incomplete responses never become prior.
 
 **Browse.** Filter across every note, or pick a folder and read anything in it. Each note
 shows what links to it, what it links out to, and which notes are closest to it that it does
@@ -64,7 +131,8 @@ no links at all.
 
 348 of my 452 notes carry `type`, `tags` and `date_created` in their frontmatter. The sidebar
 turns that into a type filter and a date range, and everything respects it: chat, themes, and
-the counts.
+the counts for the current search scope. Browse, Graph, the sidebar totals, and Explore's
+gap lists remain full-vault views; theme grouping uses the selected scope.
 
 Dates come in two shapes here. 147 notes write `2026-01-24 10:47:20` and 165 write
 `Thursday 26th February 2026 13:38:57`, which is what Obsidian's template produces. Both are
@@ -80,7 +148,8 @@ be said to fall inside it.
 
 ## How it finds things
 
-Two searches run on every question and the results are merged by rank.
+Each search merges word and meaning rankings. Default Chat runs one search per question;
+the tool loop chooses searches and note-navigation steps within its execution limits.
 
 Word matching uses SQLite's FTS5. It is what finds an exact string: a command, an error code,
 a person's name. Common words are dropped first, otherwise a note repeating "what" four times
@@ -100,37 +169,56 @@ ambiguous on its own, and the same text under `Postgres > Local setup` is not.
 
 ## Settings
 
-Everything is in the sidebar. Models are listed from whatever Ollama already has, so there is
-nothing to type and nothing to keep in sync.
+App models, scope, passages, and context are in the sidebar. The app lists local models
+already installed in Ollama and prefers the stored embedding model to avoid unnecessary
+rebuilds. Shell settings are independent of sidebar state.
 
-Under **Settings**: how many passages go to the model, and the context window. The rebuild
-button sits under the vault summary it invalidates.
+Under **Settings**, choose the passage count, context window and **Generation tokens**.
+The generation budget defaults to 800 and accepts integers 128 through 4096; it applies to
+both fixed Search chat and the experimental loop. The rebuild button sits under the vault
+summary it invalidates.
+
+`OLLAMA_HOST` defaults to `http://localhost:11434`. `AGENT_BRAIN_CHAT_MODEL` defaults to
+`qwen3:4b`; `AGENT_BRAIN_EMBED_MODEL` defaults to `nomic-embed-text`; for shell commands,
+`--embed` overrides stored metadata, which overrides the environment default. Models with
+a thinking capability use native thinking parsing; reasoning is retained for tool
+continuations and excluded from displayed answers. Generated-token limits include it.
 
 ## Development
 
 ```bash
-uv run pytest
+uv run --locked pytest
 ```
 
-66 tests, no Ollama needed. The embedding call is stubbed, because what needs checking is the
-code around the model rather than the model.
+Offline tests cover indexing recovery and scoped tools. Native HTTP and CLI integration
+tests use temporary loopback servers and Streamlit tests use its headless AppTest; no test
+reads your vault or calls a live model. GitHub Actions runs the locked environment.
+
+For live model evaluation, see [the synthetic fixture and grading guide](evals/README.md);
+its 20 cases compare fixed Search against the tool loop on temporary data, recording
+answers and admitted evidence. Literal fact matches are debugging proxies; support is
+graded manually. Keep Search as the default until the loop earns promotion.
 
 ```
-app.py            the Streamlit app, and the only entry point
+app.py            the Streamlit app
+ask.py            shell commands and argument parsing
 brain/locate.py   which folder is the vault, and where the index goes
 brain/notes.py    reading markdown and frontmatter, splitting notes into passages
 brain/index.py    the SQLite schema, building and refreshing
-brain/search.py   word matching, meaning matching, merging them, and related notes
+brain/search.py   hybrid retrieval and related note ranking
 brain/links.py    backlinks, neighbourhoods, and what the vault is missing
 brain/themes.py   clustering the notes and naming the groups
-brain/answer.py   the prompt, and fitting sources into the context window
-brain/ollama.py   embedding and streaming, over the standard library
+brain/answer.py   the fixed-search baseline prompt and source formatting
+brain/tools.py    scoped, read-only index tools
+brain/loop.py     bounded execution with evidence admission and citation checks
+brain/ollama.py   local HTTP transport, embedding, streaming, and native tool replies
 views/            one module per tab, plus notelist.py shared by all of them
+evals/            synthetic vault and case catalog, with a comparison runner
 ```
 
-Two dependencies: Streamlit, which brings numpy for the vector maths, and PyYAML for
-frontmatter. Everything else is the standard library, including the Ollama calls and the
-database.
+Runtime packages are Streamlit and PyYAML, with NumPy declared directly for vector math;
+NumPy was already installed through Streamlit. HTTP and SQLite use the standard library,
+with no agent framework or vector database required.
 
 There is no Streamlit inside `brain/` and no SQL inside `views/`. That line is worth keeping:
 it means the logic can be read and tested without the UI, and the UI can be changed without
@@ -140,3 +228,7 @@ touching the logic.
 
 Agent Brain never writes to your vault. It reads notes and answers questions, so it cannot
 corrupt anything mid-sync on a device where git is pulling.
+
+An edit during refresh leaves the cache stale and stops the caller instead of certifying
+old text as current. Re-run after the edit finishes. Failed embedding batches remain
+resumable; switching back to another model discards incompatible derived vectors.

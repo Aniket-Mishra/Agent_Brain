@@ -1,14 +1,13 @@
 [project]
 name = "agent-brain"
 version = "0.1.0"
-description = "Chat with an Obsidian vault using local models. Nothing leaves the machine."
+description = "Read-only Obsidian tools and chat using local Ollama models."
 readme = "README.md"
 requires-python = ">=3.12"
-# Streamlit is the only dependency. It brings numpy, which is all the vector
-# maths needs at this size. Everything else is the standard library.
 dependencies = [
+    "numpy>=2",
     "pyyaml>=6.0.3",
-    "streamlit>=1.40",
+    "streamlit>=1.64",
 ]
 
 [dependency-groups]
