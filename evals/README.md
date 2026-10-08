@@ -14,11 +14,11 @@ For a short smoke check, add `--case storage-choice`; select `--mode baseline` o
 
 `--max-tokens` defaults to 800 and accepts a positive integer. For a larger thinking budget, use `--context 16384 --max-tokens 1600`; thinking consumes generation tokens but is excluded from displayed answers.
 
-Each JSONL record includes the Ollama version and model digests, the answer, admitted passages, citations, and elapsed time; generation token counts come from Ollama. Model calls and tool executions are counted separately; a failed request produces an error record and unavailable measurements are omitted.
+Each JSONL record includes the Ollama version and model digests, the answer, admitted passages with source lines and truncation flags, citations, and elapsed time; generation token counts come from Ollama. Model calls and tool executions are counted separately; a failed request produces an error record and unavailable measurements are omitted.
 
 `expected_path_proxy` checks whether every expected path was admitted; `literal_fact_proxy` checks whether required text appears in the answer. These checks help locate failures. They do not establish factual support: a copied number can refer to the wrong project, and a correct paraphrase can fail the literal check. `support_grade` remains null until a person reviews the record.
 
-The baseline preserves the current fixed search and prompt flow, including its lack of follow-up history and citation validation. It records `limit` when Ollama returns `done_reason` of `length`; `answered` only means text was generated. The agent receives the fixed prior exchange on the follow-up case, and the oversized case repeats its question 2048 times; `question_bytes` records the actual input size.
+The baseline calls the same fixed Search flow as the app: one retrieval, one model call, and the shared citation validator, with no follow-up history. Both flows return `limit` for incomplete generation and reject missing or unknown citations. An `answered` status establishes citation identity only; factual support still needs grading. The agent receives the fixed prior exchange on the follow-up case, and the oversized case repeats its question 2048 times; `question_bytes` records the actual input size.
 
 Grade each answer against its expected notes and required facts, checking every factual claim, including claims outside the required list, and inspecting cited passage text. Mark `support_grade` as `pass` or `fail`, with a reason in `support_notes`.
 

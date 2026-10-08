@@ -7,60 +7,38 @@ from dataclasses import asdict
 import json
 from pathlib import Path
 import platform
-import re
 import shutil
 import sys
 import tempfile
 import time
 
-from brain import index, ollama
-from brain.answer import NOTHING_FOUND, build_messages, format_sources, source_budget
-from brain.search import Scope, search
+from brain import answer, index, loop, ollama
+from brain.search import Scope
 
 FIXTURE = Path(__file__).parent
 CASES = json.loads((FIXTURE / "cases.json").read_text(encoding="utf-8"))
 
 
 def baseline(connection, case: dict, question: str, options, scope: Scope) -> dict:
-    hits = search(connection, question, options.embed, limit=options.passages, scope=scope)
-    if not hits:
-        return {
-            "text": NOTHING_FOUND, "status": "insufficient_evidence", "evidence": (),
-            "paths": (), "cited": (), "facts": (), "cited_facts": (),
-            "tool_names": ("search",), "model_calls": 0,
-            "prompt_eval_count": 0, "eval_count": 0,
-        }
-    budget = source_budget(options.context, options.max_tokens)
-    formatted = format_sources(hits, budget)
-    admitted_count = next(
-        count for count in range(1, len(hits) + 1)
-        if format_sources(hits[:count], budget) == formatted
+    turn = answer.answer(
+        connection, question, options.model, options.embed, options.passages,
+        options.context, scope, num_predict=options.max_tokens,
     )
-    admitted = tuple(hits[:admitted_count])
-    reply = ollama.complete(
-        build_messages(question, hits, budget), options.model, options.context,
-        num_predict=options.max_tokens,
-    )
-    return {
-        "text": reply.content, "status": "limit" if reply.done_reason == "length" else "answered", "evidence": admitted,
-        "paths": tuple(dict.fromkeys(hit.path for hit in admitted)),
-        "cited": tuple(int(number) for number in re.findall(r"\[(\d+)\]", reply.content)),
-        "facts": (), "cited_facts": (),
-        "tool_names": ("search",), "model_calls": 1,
-        "prompt_eval_count": reply.prompt_eval_count, "eval_count": reply.eval_count,
-    }
+    return turn_fields(turn)
 
 
 def agent(connection, case: dict, question: str, options, scope: Scope) -> dict:
-    from brain.loop import Limits, answer
-
     prior = tuple(message["content"] for message in case.get("prior", [])) or None
-    turn = answer(
+    turn = loop.answer(
         connection, question, prior=prior, chat_model=options.model,
         embed_model=options.embed, passages=options.passages,
         context_size=options.context, scope=scope,
-        limits=Limits(num_predict=options.max_tokens),
+        limits=loop.Limits(num_predict=options.max_tokens),
     )
+    return turn_fields(turn)
+
+
+def turn_fields(turn: loop.Turn) -> dict:
     names = (
         "text", "status", "evidence", "paths", "cited", "facts", "cited_facts",
         "tool_names", "model_calls",

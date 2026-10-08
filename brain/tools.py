@@ -12,7 +12,6 @@ from brain.search import Hit, Scope
 QUERY_BYTES = 8192
 PATH_BYTES = 4096
 READ_CHARACTERS = 6000
-TRUNCATED = "\n[truncated]"
 
 
 @dataclass(frozen=True)
@@ -78,16 +77,15 @@ def read(connection: sqlite3.Connection, path: str, scope: Scope | None = None) 
     ]
     hits = retrieval.load_hits(connection, ids, "read")
     total = sum(len(hit.text) for hit in hits)
-    remaining = READ_CHARACTERS - (len(TRUNCATED) if total > READ_CHARACTERS else 0)
+    remaining = READ_CHARACTERS
     kept = []
     for hit in hits:
         if remaining <= 0:
             break
-        text = hit.text[:remaining]
-        kept.append(replace(hit, text=text))
-        remaining -= len(text)
+        kept.append(hit.shorten(remaining))
+        remaining -= len(kept[-1].text)
     if total > READ_CHARACTERS:
-        kept[-1] = replace(kept[-1], text=kept[-1].text + TRUNCATED)
+        kept[-1] = replace(kept[-1], truncated=True)
     label = "Indexed passages" if kept else f"No indexed passages in {path}."
     return ToolResult(label, tuple(kept))
 
@@ -178,8 +176,8 @@ def survey(connection: sqlite3.Connection, scope: Scope | None = None) -> ToolRe
 def format_result(result: ToolResult) -> str:
     blocks = [result.text] if result.text else []
     for number, hit in enumerate(result.evidence, start=1):
-        label = f"[{number}] {hit.path}\nTitle: {hit.title}"
+        label = f"[E{number}] {hit.location}\nTitle: {hit.title}"
         if hit.heading:
             label += f"\nHeading: {hit.heading}"
-        blocks.append(f"{label}\n\n{hit.text}")
+        blocks.append(f"{label}\n\n{hit.excerpt}")
     return "\n\n".join(blocks)

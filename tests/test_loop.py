@@ -231,7 +231,8 @@ def test_source_budget_keeps_only_delivered_metadata(indexed_loop, monkeypatch) 
         ollama.Reply("This is an excerpt [E1]."),
     ])
     turn = loop.answer(indexed_loop, "Read storage")
-    assert turn.evidence and turn.evidence[0].text.endswith("[cut]")
+    assert turn.evidence and turn.evidence[0].truncated
+    assert turn.evidence[0].excerpt.endswith("[cut]")
     assert turn.paths == ("Alpha.md",)
     assert (turn.evidence[0].title, turn.evidence[0].heading) == ("Storage decision", "Decision")
     assert all(hit.path != "Beta.md" for hit in turn.evidence)

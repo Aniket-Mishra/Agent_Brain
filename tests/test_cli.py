@@ -85,6 +85,7 @@ def test_cli_indexes_searches_reads_surveys_and_answers(cli) -> None:
     result = run("search", "SQLite", "--kind", "research", "--since", "2026-03-01", "--until", "2026-03-31")
     assert result.returncode == 0, result.stderr
     assert "Focus.md" in result.stdout and "SQLite" in result.stdout
+    assert "Focus.md:5-6" in result.stdout
     assert "Hidden.md" not in result.stdout and "Pineapple" not in result.stdout
     assert "reading notes" in result.stderr and "embedding passages" in result.stderr
     assert "embedding passages" not in result.stdout
@@ -97,6 +98,7 @@ def test_cli_indexes_searches_reads_surveys_and_answers(cli) -> None:
     result = run("ask", "What", "stores", "passages?", "--max-tokens", "123", "--timeout", "5")
     assert result.returncode == 0, result.stderr
     assert "SQLite stores local passages [E1]." in result.stdout and "Focus.md" in result.stdout
+    assert "[E1] Focus.md:5-6" in result.stdout
     assert "tool search" in result.stderr and "tool read" in result.stderr
     assert "tool search" not in result.stdout
     chats = [body for route, body in sent if route == "/api/chat"]

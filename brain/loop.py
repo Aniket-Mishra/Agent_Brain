@@ -122,22 +122,24 @@ def admit_result(
     known = {hit.chunk_id: number for number, hit in enumerate(evidence, 1)}
     for hit in result.evidence:
         if hit.chunk_id in known:
-            block = f"[E{known[hit.chunk_id]}] already retrieved: {hit.path}"
+            number = known[hit.chunk_id]
+            block = f"[E{number}] already retrieved: {evidence[number - 1].location}"
             if serialized_size("\n\n".join([*blocks, block])) - 2 <= room:
                 blocks.append(block)
             continue
         identifier = len(evidence) + 1
-        label = f"[E{identifier}] {hit.path} | {hit.title} | {hit.heading} | {hit.kind} | {hit.created}\n"
+        label = f"[E{identifier}] {hit.location} | {hit.title} | {hit.heading} | {hit.kind} | {hit.created}\n"
         prefix = "\n\n".join(blocks) + ("\n\n" if blocks else "") + label
         remaining = room - (serialized_size(prefix) - 2)
         if remaining < 64:
             break
-        text = hit.text
-        if serialized_size(text) - 2 > remaining:
+        if serialized_size(hit.excerpt) - 2 > remaining:
             marker = "\n[cut]"
-            text = clip_text(text, remaining - (serialized_size(marker) - 2)) + marker
-        blocks.append(label + text)
-        evidence.append(replace(hit, text=text))
+            text = clip_text(hit.text, remaining - (serialized_size(marker) - 2))
+            hit = hit.shorten(len(text))
+            label = f"[E{identifier}] {hit.location} | {hit.title} | {hit.heading} | {hit.kind} | {hit.created}\n"
+        blocks.append(label + hit.excerpt)
+        evidence.append(hit)
         known[hit.chunk_id] = identifier
     return "\n\n".join(blocks) or "omitted: context budget"
 

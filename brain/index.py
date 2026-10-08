@@ -23,8 +23,8 @@ from brain.notes import (
 )
 
 # INDEX_VERSION rebuilds unchanged files when parsing or vector provenance changes.
-SCHEMA_VERSION = "3"
-INDEX_VERSION = "1"
+SCHEMA_VERSION = "4"
+INDEX_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -44,21 +44,25 @@ CREATE TABLE IF NOT EXISTS chunks (
     path    TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
     heading TEXT NOT NULL DEFAULT '',
     text    TEXT NOT NULL,
+    title   TEXT NOT NULL DEFAULT '',
+    start_line INTEGER NOT NULL DEFAULT 0,
+    end_line INTEGER NOT NULL DEFAULT 0,
     vector  BLOB
 );
 CREATE INDEX IF NOT EXISTS chunks_by_path ON chunks(path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    text, heading, content='chunks', content_rowid='id',
+    text, heading, title, content='chunks', content_rowid='id',
     tokenize='porter unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS chunks_after_insert AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts(rowid, text, heading) VALUES (new.id, new.text, new.heading);
+    INSERT INTO chunks_fts(rowid, text, heading, title)
+    VALUES (new.id, new.text, new.heading, new.title);
 END;
 CREATE TRIGGER IF NOT EXISTS chunks_after_delete AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text, heading)
-    VALUES ('delete', old.id, old.text, old.heading);
+    INSERT INTO chunks_fts(chunks_fts, rowid, text, heading, title)
+    VALUES ('delete', old.id, old.text, old.heading, old.title);
 END;
 
 CREATE TABLE IF NOT EXISTS links (
@@ -265,8 +269,10 @@ def store_note(connection: sqlite3.Connection, note: Note) -> int:
 
     chunks = chunk_note(note)
     connection.executemany(
-        "INSERT INTO chunks(path, heading, text) VALUES (?, ?, ?)",
-        [(chunk.path, chunk.heading, chunk.text) for chunk in chunks],
+        "INSERT INTO chunks(path, heading, text, title, start_line, end_line) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [(chunk.path, chunk.heading, chunk.text, note.title, chunk.start_line, chunk.end_line)
+         for chunk in chunks],
     )
     return len(chunks)
 

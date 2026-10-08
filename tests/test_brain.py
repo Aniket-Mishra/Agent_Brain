@@ -11,18 +11,16 @@ from pathlib import Path
 import pytest
 
 from brain import index, links, ollama
-from brain.answer import format_sources, source_budget
+from brain.answer import build_messages
 from brain.search import Hit, Scope, search, similar_notes, to_match_query
 from brain.notes import (
     Note,
     chunk_note,
     date_from_name,
     find_links,
-    pack,
     read_date,
     read_frontmatter,
     read_note,
-    split_to_fit,
 )
 
 NOTES = {
@@ -83,19 +81,22 @@ class TestChunking:
         silently truncate.
         """
         transcript = "\n".join(f"line {number} of the talk" for number in range(2000))
-        pieces = split_to_fit(transcript, largest=2000)
+        pieces = chunk_note(Note("talk.md", "Talk", transcript, [], "d"), largest=2000)
         assert len(pieces) > 1
-        assert max(len(piece) for piece in pieces) <= 2000
+        assert max(len(piece.text) for piece in pieces) <= 2000
+        assert "".join(piece.text for piece in pieces) == transcript
 
     def test_a_single_enormous_line_is_cut(self) -> None:
-        pieces = split_to_fit("x" * 9000, largest=2000)
-        assert max(len(piece) for piece in pieces) <= 2000
+        pieces = chunk_note(Note("line.md", "Line", "x" * 9000, [], "d"), largest=2000)
+        assert max(len(piece.text) for piece in pieces) <= 2000
+        assert "".join(piece.text for piece in pieces) == "x" * 9000
 
-    def test_short_tails_do_not_become_their_own_chunk(self) -> None:
+    def test_short_tails_keep_their_content(self) -> None:
         text = "\n\n".join(["word " * 400, "word " * 400, "tiny"])
-        pieces = pack(split_to_fit(text, largest=2000), largest=2000, smallest=250)
-        assert all(len(piece) > 250 for piece in pieces)
-        assert "tiny" in pieces[-1]
+        pieces = chunk_note(Note("tail.md", "Tail", text, [], "d"), largest=2000)
+        assert max(len(piece.text) for piece in pieces) <= 2000
+        assert "".join(piece.text for piece in pieces) == text
+        assert "tiny" in pieces[-1].text
 
     def test_punctuation_only_sections_are_dropped(self) -> None:
         note = Note("n.md", "N", "# Title\n\n---\n", [], "d")
@@ -221,15 +222,12 @@ class TestLinkGraph:
 
 
 class TestPrompt:
-    def test_the_source_budget_follows_the_context_window(self) -> None:
-        assert source_budget(2048) < source_budget(32768)
-        assert source_budget(512) >= 1000
-
     def test_sources_are_numbered_and_stop_at_the_budget(self) -> None:
         hits = [Hit(number, f"{number}.md", str(number), "", "x" * 500) for number in range(20)]
-        text = format_sources(hits, budget=1200)
-        assert text.startswith("[1] 0.md")
-        assert len(text) < 2200
+        messages, admitted = build_messages("Question", hits, budget=1200)
+        assert "[E1] 0.md" in messages[-1]["content"]
+        assert len(admitted) < len(hits)
+        assert all(hit.excerpt in messages[-1]["content"] for hit in admitted)
 
 
 class TestSchemaChanges:

@@ -97,7 +97,8 @@ def test_read_truncates_passages_without_losing_metadata(indexed_tools) -> None:
     result = tools.read(connection, "Focus.md")
     assert sum(len(hit.text) for hit in result.evidence) == 6000
     assert [hit.heading for hit in result.evidence] == ["First", "Second"]
-    assert result.evidence[-1].text.endswith("[truncated]")
+    assert result.evidence[-1].truncated
+    assert result.evidence[-1].excerpt.endswith("[cut]")
     assert all(hit.title == "Storage plan" for hit in result.evidence)
 
 

@@ -114,7 +114,7 @@ def run(arguments: argparse.Namespace) -> None:
             print("\nRetrieved evidence:")
             for number, hit in enumerate(turn.evidence, 1):
                 cited = " (cited)" if number in turn.cited else ""
-                print(f"[E{number}] {hit.path} | {hit.heading}{cited}")
+                print(f"[E{number}] {hit.location} | {hit.heading}{cited}")
             for number, fact in enumerate(turn.facts, 1):
                 cited = " (cited)" if number in turn.cited_facts else ""
                 print(f"[I{number}]{cited}\n{fact.text}")

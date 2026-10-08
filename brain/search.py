@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -73,6 +73,27 @@ class Hit:
     created: str = ""
     score: float = 0.0
     found_by: set[str] = field(default_factory=set)
+    start_line: int = 0
+    end_line: int = 0
+    truncated: bool = False
+
+    @property
+    def location(self) -> str:
+        return f"{self.path}:{self.start_line}-{self.end_line}" if self.start_line else self.path
+
+    @property
+    def excerpt(self) -> str:
+        return self.text + ("\n[cut]" if self.truncated else "")
+
+    def shorten(self, length: int) -> Hit:
+        """Keep a source prefix and its occupied lines, separate from the cut marker."""
+        text = self.text[:max(0, length)]
+        start_line = self.start_line if text else 0
+        end_line = start_line + text.count("\n") - int(text.endswith("\n")) if start_line else 0
+        return replace(
+            self, text=text, start_line=start_line, end_line=end_line,
+            truncated=self.truncated or len(text) < len(self.text),
+        )
 
 
 def to_match_query(question: str) -> str | None:
@@ -118,7 +139,7 @@ def by_words(
         JOIN chunks ON chunks.id = chunks_fts.rowid
         JOIN notes ON notes.path = chunks.path
         WHERE chunks_fts MATCH ? AND {where}
-        ORDER BY bm25(chunks_fts, 1.0, 0.5) LIMIT ?
+        ORDER BY bm25(chunks_fts, 1.0, 0.5, 1.0) LIMIT ?
         """,
         [match, *values, limit],
     ).fetchall()
@@ -164,7 +185,7 @@ def load_hits(connection: sqlite3.Connection, chunk_ids: list[int], found_by: st
         return []
     placeholders = ",".join("?" * len(chunk_ids))
     rows = connection.execute(
-        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, "
+        "SELECT chunks.id, chunks.path, chunks.heading, chunks.text, chunks.start_line, chunks.end_line, "
         "notes.title, notes.kind, notes.created "
         f"FROM chunks JOIN notes ON notes.path = chunks.path WHERE chunks.id IN ({placeholders})",
         chunk_ids,
@@ -228,6 +249,8 @@ def to_hit(row: sqlite3.Row, found_by: str) -> Hit:
         kind=row["kind"],
         created=row["created"],
         found_by={found_by},
+        start_line=row["start_line"],
+        end_line=row["end_line"],
     )
 
 
