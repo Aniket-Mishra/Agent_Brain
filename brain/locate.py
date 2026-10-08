@@ -55,7 +55,7 @@ def sibling_vaults() -> list[Path]:
 
 
 def remember_vault(vault: Path) -> None:
-    prepare_cache(vault)
+    prepare_cache(vault, REMEMBERED)
     REMEMBERED.write_text(json.dumps({"vault": str(vault)}), encoding="utf-8")
 
 
@@ -76,11 +76,13 @@ def database_path(vault: Path) -> Path:
     neither is a safe home for it.
     """
     fingerprint = hashlib.blake2b(str(vault).encode(), digest_size=6).hexdigest()
-    prepare_cache(vault)
-    return CACHE_DIRECTORY / f"{vault.name}-{fingerprint}.db"
+    database = CACHE_DIRECTORY / f"{vault.name}-{fingerprint}.db"
+    prepare_cache(vault, database)
+    return database
 
 
-def prepare_cache(vault: Path) -> None:
-    if CACHE_DIRECTORY.resolve().is_relative_to(vault.resolve()):
+def prepare_cache(vault: Path, destination: Path) -> None:
+    root = vault.resolve()
+    if CACHE_DIRECTORY.resolve().is_relative_to(root) or destination.resolve().is_relative_to(root):
         raise ValueError("Set XDG_CACHE_HOME outside the vault; its files are read only")
     CACHE_DIRECTORY.mkdir(parents=True, exist_ok=True)
