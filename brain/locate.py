@@ -69,12 +69,7 @@ def read_remembered_vault() -> Path | None:
 
 
 def database_path(vault: Path) -> Path:
-    """One database per vault, kept outside both repositories.
-
-    The index holds the note text. Agent_Brain has a remote, and the vault syncs
-    over git where a large binary that changes on every edit does not belong, so
-    neither is a safe home for it.
-    """
+    """Keep one derived index per vault in the external cache."""
     fingerprint = hashlib.blake2b(str(vault).encode(), digest_size=6).hexdigest()
     database = CACHE_DIRECTORY / f"{vault.name}-{fingerprint}.db"
     prepare_cache(vault, database)

@@ -46,7 +46,7 @@ def cli(tmp_path):
                     message = {"content": "", "tool_calls": [{"function": {"name": name, "arguments": arguments}}]}
                 else:
                     message = {"content": "SQLite stores local passages [E1]."}
-                payload = {"message": message, "prompt_eval_count": 40, "eval_count": 8}
+                payload = {"message": message, "done": True, "prompt_eval_count": 40, "eval_count": 8}
             else:
                 payload = {"capabilities": ["completion", "tools"]}
             self.send_response(200)

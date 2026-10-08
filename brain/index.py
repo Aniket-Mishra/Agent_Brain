@@ -7,6 +7,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -103,19 +104,12 @@ def connect(database: Path) -> sqlite3.Connection:
 
 
 def read_schema_version(database: Path) -> str | None:
-    # `with sqlite3.connect(...)` opens a transaction, not a closing scope, so
-    # the connection has to be closed by hand or it leaks on every call.
     try:
-        probe = sqlite3.connect(database)
+        with closing(sqlite3.connect(database)) as probe:
+            row = probe.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+            return row[0] if row else None
     except sqlite3.DatabaseError:
         return None
-    try:
-        row = probe.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        return row[0] if row else None
-    except sqlite3.DatabaseError:
-        return None
-    finally:
-        probe.close()
 
 
 def discard(database: Path) -> None:
@@ -219,7 +213,7 @@ def refresh(
     }
     announce("reading notes", 0, 1)
     notes = [read_note(path, vault) for path in find_notes(vault)]
-    on_disk = {note.path: note for note in notes}
+    on_disk = {note.path for note in notes}
 
     gone = [path for path in known if path not in on_disk]
     if gone:

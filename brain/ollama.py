@@ -9,7 +9,6 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
 from dataclasses import dataclass
 
 HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -122,70 +121,27 @@ def embed_query(text: str, model: str) -> list[float]:
     return vector
 
 
-def chat_body(messages: list[dict], model: str, context_size: int, stream: bool, num_predict: int) -> dict:
+def complete(
+    messages: list[dict], model: str, context_size: int, tools: list[dict] | None = None,
+    *, num_predict: int = 800, timeout: float = 120,
+) -> Reply:
     details = model_details(model)
-    return {
+    body = {
         "model": model,
         "messages": messages,
-        "stream": stream,
+        "stream": False,
         # Native parsing separates reasoning from the answer on thinking models.
         "think": "thinking" in details.get("capabilities", []),
         "truncate": False,
         "shift": False,
         "options": {"temperature": 0.2, "num_ctx": context_size, "num_predict": num_predict},
     }
-
-
-def stream_reply(
-    messages: list[dict[str, str]], model: str, context_size: int, *, num_predict: int = 800,
-) -> Iterator[str]:
-    body = chat_body(messages, model, context_size, True, num_predict)
-    request_object = urllib.request.Request(
-        f"{local_host()}/api/chat",
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with opener().open(request_object, timeout=600) as response:
-            yield from read_events(response)
-    except (urllib.error.URLError, TimeoutError) as error:
-        raise OllamaError(explain(error, model)) from error
-
-
-def read_events(response) -> Iterator[str]:
-    """Ollama sends one JSON object per line while it generates."""
-    for line in response:
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise OllamaError("Ollama returned invalid JSON") from error
-        if not isinstance(event, dict):
-            raise OllamaError("Ollama returned an invalid response")
-        if event.get("error"):
-            raise OllamaError(str(event["error"]))
-        message = event.get("message", {})
-        if not isinstance(message, dict) or not isinstance(message.get("content", ""), str):
-            raise OllamaError("Ollama returned an invalid message")
-        piece = message.get("content", "")
-        if piece:
-            yield piece
-        if event.get("done"):
-            if event.get("done_reason") == "length":
-                raise OllamaError("Generation token limit reached before a complete answer")
-            return
-    raise OllamaError("Ollama stream ended before a complete answer")
-
-
-def complete(
-    messages: list[dict], model: str, context_size: int, tools: list[dict] | None = None,
-    *, num_predict: int = 800, timeout: float = 120,
-) -> Reply:
-    body = chat_body(messages, model, context_size, False, num_predict)
     if tools is not None:
         body["tools"] = tools
-    return parse_reply(request("/api/chat", body, timeout=timeout))
+    payload = request("/api/chat", body, timeout=timeout)
+    if payload.get("done") is not True:
+        raise OllamaError("Ollama response ended before a complete answer")
+    return parse_reply(payload)
 
 
 def parse_reply(payload: dict) -> Reply:

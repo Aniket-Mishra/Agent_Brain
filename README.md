@@ -138,19 +138,14 @@ no links at all.
 
 ## Narrowing the search
 
-348 of my 452 notes carry `type`, `tags` and `date_created` in their frontmatter. The sidebar
-turns that into a type filter and a date range, and everything respects it: chat, themes, and
-the counts for the current search scope. Browse, Graph, the sidebar totals, and Explore's
-gap lists remain full-vault views; theme grouping uses the selected scope.
+Frontmatter supplies note types and creation dates for the sidebar filters; Chat, themes,
+and search-scope counts use those filters. Browse, Graph, sidebar totals, and Explore's
+gap lists show the full vault.
 
-Dates come in two shapes here. 147 notes write `2026-01-24 10:47:20` and 165 write
-`Thursday 26th February 2026 13:38:57`, which is what Obsidian's template produces. Both are
-read. Month names are matched from a table rather than through `strptime`, because `%B`
-follows the machine's locale and the answer has to be the same on every device you clone to.
-
-This exists because of a specific failure. Asked "what did I work on in March 2026?", the
-search matched *March* and *2026* as words and returned January notes. A date range cannot be
-wrong in that way, and it needs no date parsing to get right.
+Dates can be ISO timestamps such as `2026-01-24 10:47:20` or English dates such as
+`Thursday 26th February 2026 13:38:57`; English months use a fixed table so parsing works
+across machine locales. Use the date filter when a question requires a date range;
+mentioning a month in free text searches its words.
 
 Notes with no date are excluded once a range is set, because an undated note cannot honestly
 be said to fall inside it.
@@ -222,7 +217,7 @@ brain/themes.py   clustering the notes and naming the groups
 brain/answer.py   one-search answers using shared evidence and citation checks
 brain/tools.py    scoped, read-only index tools
 brain/loop.py     bounded execution with evidence admission and citation checks
-brain/ollama.py   local HTTP transport, embedding, streaming, and native tool replies
+brain/ollama.py   local HTTP transport, embeddings, and completed chat replies
 views/            one module per tab, plus notelist.py shared by all of them
 evals/            synthetic vault and case catalog, with a comparison runner
 ```
@@ -234,6 +229,32 @@ with no agent framework or vector database required.
 There is no Streamlit inside `brain/` and no SQL inside `views/`. That line is worth keeping:
 it means the logic can be read and tested without the UI, and the UI can be changed without
 touching the logic.
+
+### Reading the code
+
+Start with `brain/notes.py`: `read_note` reads metadata and `chunk_note` preserves passage
+text and line ranges; `brain/index.py:refresh` stores those passages and embeddings in
+SQLite. `brain/search.py:search` merges word and vector rankings.
+
+`brain/answer.py:answer` performs one search and one chat call; the optional
+`brain/loop.py:answer` lets the model call the five read-only functions in `brain/tools.py`.
+Both use the same evidence admission and citation checks in `brain/loop.py`.
+`brain/ollama.py:complete` sends the chat request and requires Ollama's completion flag.
+
+```mermaid
+flowchart LR
+    Notes[Vault Markdown] --> Parser[notes.py]
+    Parser --> Cache[index.py: SQLite]
+    Question --> Search[search.py]
+    Cache --> Search
+    Search --> Evidence[loop.py: admit evidence]
+    Evidence --> Model[ollama.py: complete]
+    Model --> Check[loop.py: check citations]
+    Check --> Display[views/chat.py or ask.py]
+```
+
+The diagram shows fixed Search; for exploration, read the bounded loop after tracing that
+flow. `app.py` and `ask.py` handle configuration and presentation; neither changes notes.
 
 ## Read only
 

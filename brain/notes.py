@@ -101,7 +101,7 @@ def read_note(path: Path, vault: Path) -> Note:
 
 
 def read_title(fields: dict, fallback: str) -> str:
-    """Notes here use `note_title`; `title` is the more common convention."""
+    """Prefer note_title, then title, then the filename."""
     for key in ("note_title", "title"):
         declared = str(fields.get(key) or "").strip()
         if declared:
@@ -110,15 +110,7 @@ def read_title(fields: dict, fallback: str) -> str:
 
 
 def read_frontmatter(text: str) -> dict:
-    """The YAML block at the top of a note, or nothing if it will not parse.
-
-    348 of 452 notes here carry `type`, `tags` and `date_created`. That is the
-    author's own filing system, and it is worth more than anything inferred.
-    Malformed YAML is treated as absent rather than fatal: one bad note must
-    not stop the index.
-    """
-    if not text.strip():
-        return {}
+    """Read a frontmatter mapping; malformed YAML is treated as absent."""
     try:
         loaded = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -152,15 +144,9 @@ def read_date(fields: dict) -> str:
 
 
 def read_spelled_date(raw: str) -> str:
-    """Dates written out in words, as Obsidian's template produces them.
+    """Read English month names independently of the machine's locale.
 
-    `Thursday 26th February 2026 13:38:57` is the shape used by 165 notes in
-    this vault. Reading only ISO dates left every one of them undated and so
-    invisible to a date filter.
-
-    The month names are matched from a table rather than through strptime,
-    because %B follows the machine's locale and this has to give the same
-    answer on every device the vault is cloned to.
+    strptime's %B follows the locale and could miss dates on another device.
     """
     match = SPELLED_DATE.search(raw)
     if not match:
