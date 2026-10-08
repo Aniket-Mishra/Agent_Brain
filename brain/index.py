@@ -1,4 +1,4 @@
-"""The index: one SQLite file holding chunks, their vectors, and the link graph."""
+"""A SQLite passage cache with vectors and the vault's link graph."""
 
 from __future__ import annotations
 
@@ -22,10 +22,9 @@ from brain.notes import (
     read_note,
 )
 
-# Bump this when the tables change, and also when the parser starts reading
-# something it did not before. A note's digest is of its file, so a parser
-# change alone leaves every digest matching and the refresh skips the lot.
+# INDEX_VERSION rebuilds unchanged files when parsing or vector provenance changes.
 SCHEMA_VERSION = "3"
+INDEX_VERSION = "1"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
@@ -148,13 +147,26 @@ def vault_fingerprint(vault: Path) -> str:
     and still notices edits, additions, deletions and renames.
     """
     entries = sorted(
-        (path.relative_to(vault).as_posix(), path.stat().st_mtime) for path in find_notes(vault)
+        (path.relative_to(vault).as_posix(), path.stat().st_mtime_ns, path.stat().st_size)
+        for path in find_notes(vault)
     )
     return hashlib.blake2b(repr(entries).encode("utf-8"), digest_size=8).hexdigest()
 
 
-def is_current(connection: sqlite3.Connection, vault: Path, model: str) -> bool:
+def is_current(
+    connection: sqlite3.Connection,
+    vault: Path,
+    model: str,
+    *,
+    model_digest: str | None = None,
+) -> bool:
+    if read_meta(connection, "index_version") != INDEX_VERSION:
+        return False
     if not same_model(read_meta(connection, "embedding_model"), model):
+        return False
+    if model_digest is not None and read_meta(connection, "embedding_digest") != model_digest:
+        return False
+    if connection.execute("SELECT 1 FROM chunks WHERE vector IS NULL LIMIT 1").fetchone():
         return False
     return read_meta(connection, "vault_fingerprint") == vault_fingerprint(vault)
 
@@ -168,6 +180,8 @@ def refresh(
     vault: Path,
     model: str,
     progress: Callable[[str, int, int], None] | None = None,
+    *,
+    model_digest: str | None = None,
 ) -> Report:
     """Bring the index in line with what is on disk, re-embedding only what changed."""
     started = time.perf_counter()
@@ -175,11 +189,26 @@ def refresh(
     announce = progress or (lambda *_: None)
 
     stored_model = read_meta(connection, "embedding_model")
-    if stored_model is not None and not same_model(stored_model, model):
-        # Vectors from two models are not comparable, so there is nothing to keep.
-        connection.execute("DELETE FROM notes")
-        report.rebuilt = True
+    outdated = read_meta(connection, "index_version") != INDEX_VERSION
+    model_changed = stored_model is not None and not same_model(stored_model, model)
+    digest_changed = (
+        model_digest is not None and read_meta(connection, "embedding_digest") != model_digest
+    )
+    with connection:
+        connection.execute("DELETE FROM meta WHERE key = 'vault_fingerprint'")
+        if outdated or model_changed or digest_changed:
+            report.rebuilt = bool(connection.execute("SELECT 1 FROM notes LIMIT 1").fetchone())
+            connection.execute("DELETE FROM notes")
+            connection.execute("DELETE FROM links")
+        # Batch commits must carry their model even when a later batch fails.
+        write_meta(connection, "embedding_model", model)
+        write_meta(connection, "index_version", INDEX_VERSION)
+        if model_digest is None:
+            connection.execute("DELETE FROM meta WHERE key = 'embedding_digest'")
+        else:
+            write_meta(connection, "embedding_digest", model_digest)
 
+    starting_fingerprint = vault_fingerprint(vault)
     known = {
         row["path"]: row["digest"]
         for row in connection.execute("SELECT path, digest FROM notes")
@@ -208,8 +237,8 @@ def refresh(
     connection.commit()
 
     embed_missing(connection, model, announce)
-    write_meta(connection, "embedding_model", model)
-    write_meta(connection, "vault_fingerprint", vault_fingerprint(vault))
+    if starting_fingerprint == vault_fingerprint(vault):
+        write_meta(connection, "vault_fingerprint", starting_fingerprint)
     write_meta(connection, "indexed_at", time.time())
     connection.commit()
 
@@ -259,17 +288,41 @@ def embed_missing(
         "SELECT chunks.id, chunks.heading, chunks.text, notes.title "
         "FROM chunks JOIN notes ON notes.path = chunks.path WHERE chunks.vector IS NULL"
     ).fetchall()
+    widths = {
+        row[0] for row in connection.execute(
+            "SELECT DISTINCT length(vector) FROM chunks WHERE vector IS NOT NULL"
+        )
+    }
+    if len(widths) > 1 or any(width == 0 or width % 4 for width in widths):
+        raise ollama.OllamaError("The index contains incompatible embedding dimensions")
+    width = next(iter(widths), 0) // 4
 
     for start in range(0, len(rows), batch_size):
         batch = rows[start: start + batch_size]
         texts = [embedding_text(row["title"], row["heading"], row["text"]) for row in batch]
-        vectors = ollama.embed_documents(texts, model)
+        vectors = validate_embeddings(ollama.embed_documents(texts, model), len(batch), width)
+        width = vectors.shape[1]
         connection.executemany(
             "UPDATE chunks SET vector = ? WHERE id = ?",
             [(pack(vector), row["id"]) for row, vector in zip(batch, vectors)],
         )
         connection.commit()
         announce("embedding passages", min(start + batch_size, len(rows)), len(rows))
+
+
+def validate_embeddings(vectors: list[list[float]], count: int, width: int) -> np.ndarray:
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            matrix = np.asarray(vectors, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ollama.OllamaError("Ollama returned malformed embeddings") from error
+    if matrix.ndim != 2 or matrix.shape[0] != count or matrix.shape[1] == 0:
+        raise ollama.OllamaError("Ollama returned the wrong number or shape of embeddings")
+    if width and matrix.shape[1] != width:
+        raise ollama.OllamaError("Ollama changed embedding dimensions during indexing")
+    if not np.isfinite(matrix).all():
+        raise ollama.OllamaError("Ollama returned non-finite embeddings")
+    return matrix
 
 
 def rewrite_links(connection: sqlite3.Connection, notes: list[Note]) -> None:
@@ -314,11 +367,12 @@ def edges_from(note: Note, by_name: dict[str, str]) -> set[tuple[str, str | None
     return found
 
 
-def pack(vector: list[float]) -> bytes:
+def pack(vector: list[float] | np.ndarray) -> bytes:
     """Store unit vectors, so a dot product is already the cosine."""
-    array = np.asarray(vector, dtype=np.float32)
+    array = np.asarray(vector, dtype=np.float64)
     length = float(np.linalg.norm(array))
-    return (array if length == 0 else array / length).tobytes()
+    normalized = array if length == 0 else array / length
+    return normalized.astype(np.float32).tobytes()
 
 
 def all_paths(connection: sqlite3.Connection) -> list[str]:

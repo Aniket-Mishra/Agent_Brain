@@ -1,6 +1,8 @@
 # The index lives in ~/.cache/agent_brain, never here. This is belt and braces:
 # it holds vault text, and this repo has a remote.
 *.db
+*.db-wal
+*.db-shm
 .cache/
 
 .venv/

@@ -3,29 +3,37 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 import streamlit as st
 
-from brain import links, themes
-from views import notelist
+from brain import index, links, themes
 from brain.search import Scope
+from views import notelist
 
 
-def render(connection: sqlite3.Connection, chat_model: str, scope: Scope) -> None:
-    show_themes(connection, chat_model, scope)
+def render(connection: sqlite3.Connection, chat_model: str, scope: Scope, vault_identity: str) -> None:
+    show_themes(connection, chat_model, scope, vault_identity)
     st.divider()
     show_gaps(connection)
 
 
-def show_themes(connection: sqlite3.Connection, chat_model: str, scope: Scope) -> None:
+def show_themes(connection: sqlite3.Connection, chat_model: str, scope: Scope, vault_identity: str) -> None:
     st.subheader("Themes")
     st.caption(
         "Groups the notes by what they are about, then names each group. "
         "Uses the vectors already in the index, and one model call per group."
     )
 
-    count = st.slider("Groups", 3, 12, 8)
+    count = st.slider("Groups", 3, 12, 8, key="theme_groups")
+    identity = (
+        vault_identity, scope, chat_model, count,
+        *(index.read_meta(connection, key) for key in (
+            "vault_fingerprint", "indexed_at", "embedding_model", "embedding_digest", "index_version",
+        )),
+    )
+    if st.session_state.get("themes_identity") != identity:
+        st.session_state.pop("themes", None)
+        st.session_state["themes_identity"] = identity
     if st.button("Find themes", type="primary"):
         with st.spinner("Grouping notes and naming the groups"):
             st.session_state["themes"] = themes.find_themes(
@@ -46,6 +54,7 @@ def show_themes(connection: sqlite3.Connection, chat_model: str, scope: Scope) -
 
 def show_gaps(connection: sqlite3.Connection) -> None:
     st.subheader("Worth your attention")
+    st.caption("These counts cover the full vault, including notes outside the search filters.")
     unwritten, stubs, orphans = (
         links.unwritten(connection),
         links.stubs(connection),
@@ -73,4 +82,3 @@ def show_gaps(connection: sqlite3.Connection) -> None:
     with alone:
         st.caption("No links in or out. Nothing points at these and they point nowhere.")
         notelist.show(orphans, key="orphan")
-

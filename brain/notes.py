@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import yaml
@@ -62,6 +63,7 @@ def embedding_text(title: str, heading: str, text: str) -> str:
 
 
 def find_notes(vault: Path) -> list[Path]:
+    root = vault.resolve()
     notes = []
     for directory, subdirectories, filenames in os.walk(vault):
         subdirectories[:] = [
@@ -69,11 +71,17 @@ def find_notes(vault: Path) -> list[Path]:
             for name in subdirectories
             if name not in SKIPPED_DIRECTORIES and not name.startswith(".")
         ]
-        notes.extend(Path(directory) / name for name in filenames if name.endswith(".md"))
+        notes.extend(
+            path for name in filenames
+            if name.endswith(".md")
+            and (path := Path(directory) / name).resolve().is_relative_to(root)
+        )
     return sorted(notes)
 
 
 def read_note(path: Path, vault: Path) -> Note:
+    if not path.resolve().is_relative_to(vault.resolve()):
+        raise ValueError("Note path resolves outside the vault")
     raw = path.read_text(encoding="utf-8", errors="replace")
     match = FRONTMATTER.match(raw)
     body = raw[match.end():] if match else raw
@@ -129,12 +137,14 @@ def as_list(value: object) -> list[str]:
 
 
 def read_date(fields: dict) -> str:
-    """An ISO date for filtering, from whichever field the note happens to use."""
+    """Read the first valid calendar date in note frontmatter."""
     for key in ("date_created", "created", "date"):
         raw = str(fields.get(key, ""))
         found = ISO_DATE.search(raw)
         if found:
-            return found.group(0)
+            parsed = valid_date(found.group(0))
+            if parsed:
+                return parsed
         spelled = read_spelled_date(raw)
         if spelled:
             return spelled
@@ -159,13 +169,20 @@ def read_spelled_date(raw: str) -> str:
     month = MONTHS.get(month_name[:3].lower())
     if not month:
         return ""
-    return f"{year}-{month:02d}-{int(day):02d}"
+    return valid_date(f"{year}-{month:02d}-{int(day):02d}")
+
+
+def valid_date(raw: str) -> str:
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError:
+        return ""
 
 
 def date_from_name(path: str) -> str:
     """Many notes carry their date in the filename and nowhere else."""
     found = ISO_DATE.search(Path(path).name)
-    return found.group(0) if found else ""
+    return valid_date(found.group(0)) if found else ""
 
 
 def find_links(body: str) -> list[str]:

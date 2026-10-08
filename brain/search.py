@@ -47,6 +47,8 @@ class Scope:
             values.extend(self.kinds)
         # Notes with no date are excluded once a range is set, because an
         # undated note cannot honestly be said to fall inside it.
+        if self.since or self.until:
+            tests.append("notes.created != ''")
         if self.since:
             tests.append("notes.created >= ?")
             values.append(self.since)
@@ -259,7 +261,11 @@ def note_vectors(connection: sqlite3.Connection) -> tuple[list[str], np.ndarray]
 
 
 def similar_notes(
-    connection: sqlite3.Connection, path: str, limit: int = 6, unlinked_only: bool = True
+    connection: sqlite3.Connection,
+    path: str,
+    limit: int = 6,
+    unlinked_only: bool = True,
+    scope: Scope | None = None,
 ) -> list[tuple[str, float]]:
     """Notes closest to this one that it does not already link to.
 
@@ -277,5 +283,12 @@ def similar_notes(
 
         skip |= set(neighbours(connection, path))
 
+    where, values = (scope or Scope()).clause()
+    allowed = {
+        row["path"] for row in connection.execute(f"SELECT path FROM notes WHERE {where}", values)
+    }
+
     ranked = sorted(zip(paths, scores), key=lambda pair: -pair[1])
-    return [(other, float(score)) for other, score in ranked if other not in skip][:limit]
+    return [
+        (other, float(score)) for other, score in ranked if other not in skip and other in allowed
+    ][:limit]
