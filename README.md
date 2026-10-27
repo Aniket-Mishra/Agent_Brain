@@ -35,8 +35,8 @@ uv run streamlit run app.py --server.address 127.0.0.1 --browser.gatherUsageStat
 
 The first launch reads your vault and builds the index; later launches check freshness and
 re-embed changed notes. An older cache rebuilds derived rows once to remove ambiguous
-embedding provenance; a model change, including a digest change under the same tag, also
-rebuilds the cache. Vault files remain untouched.
+embedding provenance and store source lines; a model change, including a digest change
+under the same tag, also rebuilds the cache. Vault files remain untouched.
 
 ## Using it on another device
 
@@ -83,9 +83,9 @@ The five deterministic commands return passages or index facts without a chat mo
 Search embeds the query; related needs current vectors.
 
 Every command refreshes a stale index, which can require Ollama. A current cache supports
-`read`, `backlinks`, and `survey`
-with Ollama stopped. `read` returns indexed passages with headings, not the complete
-original Markdown file; very short sections may be absent and long reads are truncated.
+`read`, `backlinks`, and `survey` with Ollama stopped. `read` returns indexed passages
+with headings, not the complete original Markdown file; meaningful short facts are retained
+and long reads are truncated.
 
 All commands accept `--embed`, repeated `--kind`, and `--since` / `--until` in `YYYY-MM-DD`.
 Search and ask accept `--passages` from 3 to 15; ask also accepts `--model`, `--context`
@@ -97,10 +97,17 @@ a 120-second chat timeout. Override these with `--max-calls`, `--max-tools`, `--
 and `--timeout`; `--max-tokens` takes a positive integer. Execution and context limits
 produce a labeled incomplete result.
 
-Answers use `[E1]` passage identifiers and `[I1]` computed index identifiers; the output
-maps each identifier to retrieved evidence and marks cited items. Unseen or missing
-citations fail validation. A known identifier proves that evidence was retrieved;
+Both chat modes use `[E1]` passage identifiers and exploration also uses `[I1]` computed
+index identifiers; the output maps each identifier to retrieved evidence and marks cited items.
+Unknown identifiers and completed replies without any citations fail validation.
+A known identifier proves that evidence was retrieved;
 inspect the passage to judge whether it supports the claim.
+
+Passage sources show the relative note path and original 1-based line range, such as
+`projects/Atlas.md:8-12`, plus the heading and exact admitted excerpt. Lines refer to the
+indexed version of the note; later edits can move them. Refresh to read those edits.
+The app's **Open note in Obsidian** link uses Obsidian's [native URI](https://help.obsidian.md/Extending+Obsidian/Obsidian+URI)
+to open the exact note; line numbers remain visible beside the excerpt.
 
 Stdout contains results; stderr contains progress and errors. Success, including an
 explicit insufficient-evidence or limit result, exits 0; model/index failures exit 1;
@@ -109,7 +116,9 @@ invalid invocations exit 2. `uv run python ask.py --help` lists commands.
 ## What it does
 
 **Chat.** Ask a question to get an answer alongside retrieved notes; every source shows its
-path, heading, type and date, and whether words or meaning found it. Enable **Explore notes
+path, source lines, heading, type and date, and whether words or meaning found it.
+Search makes one model call, validates citations before displaying the completed reply,
+and displays only passages admitted to the prompt. Enable **Explore notes
 with tools (experimental)** to use the bounded loop. It keeps one good prior exchange for
 reference resolution, retrieving supporting facts again; a vault or scope change clears
 the prior pair. Error and incomplete responses never become prior.
@@ -129,19 +138,14 @@ no links at all.
 
 ## Narrowing the search
 
-348 of my 452 notes carry `type`, `tags` and `date_created` in their frontmatter. The sidebar
-turns that into a type filter and a date range, and everything respects it: chat, themes, and
-the counts for the current search scope. Browse, Graph, the sidebar totals, and Explore's
-gap lists remain full-vault views; theme grouping uses the selected scope.
+Frontmatter supplies note types and creation dates for the sidebar filters; Chat, themes,
+and search-scope counts use those filters. Browse, Graph, sidebar totals, and Explore's
+gap lists show the full vault.
 
-Dates come in two shapes here. 147 notes write `2026-01-24 10:47:20` and 165 write
-`Thursday 26th February 2026 13:38:57`, which is what Obsidian's template produces. Both are
-read. Month names are matched from a table rather than through `strptime`, because `%B`
-follows the machine's locale and the answer has to be the same on every device you clone to.
-
-This exists because of a specific failure. Asked "what did I work on in March 2026?", the
-search matched *March* and *2026* as words and returned January notes. A date range cannot be
-wrong in that way, and it needs no date parsing to get right.
+Dates can be ISO timestamps such as `2026-01-24 10:47:20` or English dates such as
+`Thursday 26th February 2026 13:38:57`; English months use a fixed table so parsing works
+across machine locales. Use the date filter when a question requires a date range;
+mentioning a month in free text searches its words.
 
 Notes with no date are excluded once a range is set, because an undated note cannot honestly
 be said to fall inside it.
@@ -152,8 +156,8 @@ Each search merges word and meaning rankings. Default Chat runs one search per q
 the tool loop chooses searches and note-navigation steps within its execution limits.
 
 Word matching uses SQLite's FTS5. It is what finds an exact string: a command, an error code,
-a person's name. Common words are dropped first, otherwise a note repeating "what" four times
-outranks the note that answers you.
+a person's name, or a note title. Common words are dropped first, otherwise a note repeating
+"what" four times outranks the note that answers you.
 
 Meaning matching embeds the question and compares it against every passage. At this size that
 is a few milliseconds of numpy, so there is no vector index to build or maintain. The same
@@ -166,6 +170,8 @@ topping one.
 
 Notes are split at their headings, and each piece carries its heading path. "use port 5432" is
 ambiguous on its own, and the same text under `Postgres > Local setup` is not.
+Merged sections keep their intervening headings. Passages retain contiguous original text;
+headings inside fenced code do not become section boundaries.
 
 ## Settings
 
@@ -208,10 +214,10 @@ brain/index.py    the SQLite schema, building and refreshing
 brain/search.py   hybrid retrieval and related note ranking
 brain/links.py    backlinks, neighbourhoods, and what the vault is missing
 brain/themes.py   clustering the notes and naming the groups
-brain/answer.py   the fixed-search baseline prompt and source formatting
+brain/answer.py   one-search answers using shared evidence and citation checks
 brain/tools.py    scoped, read-only index tools
 brain/loop.py     bounded execution with evidence admission and citation checks
-brain/ollama.py   local HTTP transport, embedding, streaming, and native tool replies
+brain/ollama.py   local HTTP transport, embeddings, and completed chat replies
 views/            one module per tab, plus notelist.py shared by all of them
 evals/            synthetic vault and case catalog, with a comparison runner
 ```
@@ -223,6 +229,32 @@ with no agent framework or vector database required.
 There is no Streamlit inside `brain/` and no SQL inside `views/`. That line is worth keeping:
 it means the logic can be read and tested without the UI, and the UI can be changed without
 touching the logic.
+
+### Reading the code
+
+Start with `brain/notes.py`: `read_note` reads metadata and `chunk_note` preserves passage
+text and line ranges; `brain/index.py:refresh` stores those passages and embeddings in
+SQLite. `brain/search.py:search` merges word and vector rankings.
+
+`brain/answer.py:answer` performs one search and one chat call; the optional
+`brain/loop.py:answer` lets the model call the five read-only functions in `brain/tools.py`.
+Both use the same evidence admission and citation checks in `brain/loop.py`.
+`brain/ollama.py:complete` sends the chat request and requires Ollama's completion flag.
+
+```mermaid
+flowchart LR
+    Notes[Vault Markdown] --> Parser[notes.py]
+    Parser --> Cache[index.py: SQLite]
+    Question --> Search[search.py]
+    Cache --> Search
+    Search --> Evidence[loop.py: admit evidence]
+    Evidence --> Model[ollama.py: complete]
+    Model --> Check[loop.py: check citations]
+    Check --> Display[views/chat.py or ask.py]
+```
+
+The diagram shows fixed Search; for exploration, read the bounded loop after tracing that
+flow. `app.py` and `ask.py` handle configuration and presentation; neither changes notes.
 
 ## Read only
 

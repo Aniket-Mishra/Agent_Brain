@@ -169,7 +169,7 @@ def test_cache_contract_invalidates_old_dates_and_vectors(connection, vault, mon
     assert not index.is_current(connection, vault, "model-a")
     assert index.refresh(connection, vault, "model-a").rebuilt
     assert connection.execute("SELECT 1 FROM notes WHERE created != ''").fetchone() is None
-    assert index.read_meta(connection, "schema_version") == "3"
+    assert index.read_meta(connection, "schema_version") == index.SCHEMA_VERSION
 
 
 def test_missing_vector_never_reports_current(connection, vault, monkeypatch) -> None:

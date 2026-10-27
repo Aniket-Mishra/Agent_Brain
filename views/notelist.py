@@ -9,13 +9,7 @@ import streamlit as st
 
 
 def labels_for(paths: list[str]) -> dict[str, str]:
-    """Display names, with the folder added only where names collide.
-
-    Three separate notes called THESIS_EDITS_TODO otherwise render as three
-    identical buttons and the reader cannot tell which is which. Adding the
-    folder to every name would be noise, so it is added only where it settles
-    an ambiguity.
-    """
+    """Add folder labels only when note names collide."""
     stems = Counter(Path(path).stem for path in paths)
     return {
         path: (

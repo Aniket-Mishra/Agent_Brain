@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -12,15 +13,11 @@ from pathlib import Path
 import yaml
 
 SKIPPED_DIRECTORIES = {".obsidian", ".trash", ".git", ".github", "node_modules", "__pycache__"}
-# Below this many characters of actual words, a piece is punctuation and headings.
-LEAST_REAL_CONTENT = 20
-# Tried in order when a piece is too large. An empty separator means cut on length.
-SEPARATORS = ("\n\n", "\n")
-
 FRONTMATTER = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.DOTALL)
 FENCED_CODE = re.compile(r"^[ \t]{0,3}(```|~~~).*?^[ \t]{0,3}\1", re.DOTALL | re.MULTILINE)
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 WIKILINK = re.compile(r"!?\[\[([^\[\]\n|#]+)")
-HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", re.MULTILINE)
+HEADING = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 SPELLED_DATE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\s+(\d{4})\b")
 MONTHS = {
@@ -29,7 +26,6 @@ MONTHS = {
         "jan feb mar apr may jun jul aug sep oct nov dec".split(), start=1
     )
 }
-MARKUP_ONLY = re.compile(r"[#\-*_>`|~\s]+")
 
 
 @dataclass(frozen=True)
@@ -43,6 +39,7 @@ class Note:
     kind: str = ""
     tags: list[str] = field(default_factory=list)
     created: str = ""
+    body_start_line: int = 1
 
 
 @dataclass(frozen=True)
@@ -50,6 +47,8 @@ class Chunk:
     path: str
     heading: str
     text: str
+    start_line: int = 0
+    end_line: int = 0
 
 
 def embedding_text(title: str, heading: str, text: str) -> str:
@@ -97,11 +96,12 @@ def read_note(path: Path, vault: Path) -> Note:
         kind=str(fields.get("type") or "").strip(),
         tags=as_list(fields.get("tags")),
         created=read_date(fields),
+        body_start_line=raw.count("\n", 0, match.end()) + 1 if match else 1,
     )
 
 
 def read_title(fields: dict, fallback: str) -> str:
-    """Notes here use `note_title`; `title` is the more common convention."""
+    """Prefer note_title, then title, then the filename."""
     for key in ("note_title", "title"):
         declared = str(fields.get(key) or "").strip()
         if declared:
@@ -110,15 +110,7 @@ def read_title(fields: dict, fallback: str) -> str:
 
 
 def read_frontmatter(text: str) -> dict:
-    """The YAML block at the top of a note, or nothing if it will not parse.
-
-    348 of 452 notes here carry `type`, `tags` and `date_created`. That is the
-    author's own filing system, and it is worth more than anything inferred.
-    Malformed YAML is treated as absent rather than fatal: one bad note must
-    not stop the index.
-    """
-    if not text.strip():
-        return {}
+    """Read a frontmatter mapping; malformed YAML is treated as absent."""
     try:
         loaded = yaml.safe_load(text)
     except yaml.YAMLError:
@@ -152,15 +144,9 @@ def read_date(fields: dict) -> str:
 
 
 def read_spelled_date(raw: str) -> str:
-    """Dates written out in words, as Obsidian's template produces them.
+    """Read English month names independently of the machine's locale.
 
-    `Thursday 26th February 2026 13:38:57` is the shape used by 165 notes in
-    this vault. Reading only ISO dates left every one of them undated and so
-    invisible to a date filter.
-
-    The month names are matched from a table rather than through strptime,
-    because %B follows the machine's locale and this has to give the same
-    answer on every device the vault is cloned to.
+    strptime's %B follows the locale and could miss dates on another device.
     """
     match = SPELLED_DATE.search(raw)
     if not match:
@@ -198,70 +184,76 @@ def find_links(body: str) -> list[str]:
 
 
 def chunk_note(note: Note, largest: int = 2000, smallest: int = 250) -> list[Chunk]:
-    """Split a note at its headings, keeping the heading path with each piece."""
+    """Keep each passage a contiguous slice of the original note body."""
     sections = merge_short_sections(split_on_headings(note.body), smallest, largest)
-
+    newlines = [match.start() for match in re.finditer("\n", note.body)]
     chunks = []
-    for heading, text in sections:
-        pieces = pack(split_to_fit(text, largest), largest, smallest)
-        chunks.extend(Chunk(note.path, heading, piece) for piece in pieces if has_content(piece))
+    for heading, start, end in sections:
+        for first, last in split_spans(note.body, start, end, largest):
+            text = note.body[first:last]
+            if has_content(text):
+                chunks.append(Chunk(
+                    note.path, heading, text,
+                    note.body_start_line + bisect_left(newlines, first),
+                    note.body_start_line + bisect_left(newlines, last - 1),
+                ))
     return chunks
 
 
 def has_content(text: str) -> bool:
-    """Reject pieces that are only markdown punctuation.
-
-    A horizontal rule under its own heading is a real section boundary and an
-    empty chunk, and indexing it wastes a row that can still be retrieved.
-    """
-    return len(MARKUP_ONLY.sub("", text)) >= LEAST_REAL_CONTENT
+    return any(character.isalnum() for character in text)
 
 
-def split_on_headings(body: str) -> list[tuple[str, str]]:
-    """Section bodies, each labelled with its full heading path."""
-    headings = list(HEADING.finditer(body))
+def split_on_headings(body: str) -> list[tuple[str, int, int]]:
+    """Heading paths and source offsets, with fenced code left intact."""
+    headings = []
+    ancestors: list[tuple[int, str]] = []
+    fence = None
+    offset = 0
+    for line in body.splitlines(keepends=True):
+        text = line.rstrip("\r\n")
+        marker = FENCE.match(text)
+        if marker:
+            marks, trailing = marker.groups()
+            if fence is None:
+                fence = (marks[0], len(marks))
+            elif marks[0] == fence[0] and len(marks) >= fence[1] and not trailing.strip():
+                fence = None
+        elif fence is None and (heading := HEADING.match(text)):
+            level = len(heading.group(1))
+            while ancestors and ancestors[-1][0] >= level:
+                ancestors.pop()
+            ancestors.append((level, heading.group(2).strip()))
+            headings.append((offset, offset + len(line), " > ".join(name for _, name in ancestors)))
+        offset += len(line)
     if not headings:
-        return [("", body.strip())] if body.strip() else []
+        return [("", 0, len(body))] if has_content(body) else []
 
     sections = []
-    preamble = body[: headings[0].start()].strip()
-    if preamble:
-        sections.append(("", preamble))
-
-    ancestors: list[tuple[int, str]] = []
-    for position, heading in enumerate(headings):
-        level = len(heading.group(1))
-        while ancestors and ancestors[-1][0] >= level:
-            ancestors.pop()
-        ancestors.append((level, heading.group(2).strip()))
-
-        end = headings[position + 1].start() if position + 1 < len(headings) else len(body)
-        text = body[heading.end(): end].strip()
-        if text:
-            sections.append((" > ".join(name for _level, name in ancestors), text))
+    if has_content(body[:headings[0][0]]):
+        sections.append(("", 0, headings[0][0]))
+    for position, (start, content_start, heading) in enumerate(headings):
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(body)
+        if has_content(body[content_start:end]):
+            sections.append((heading, start, end))
     return sections
 
 
 def merge_short_sections(
-    sections: list[tuple[str, str]], smallest: int, largest: int
-) -> list[tuple[str, str]]:
-    """Fold tiny sections into their neighbour.
-
-    A heavily nested note otherwise produces one chunk per `###` holding a
-    single sentence, which retrieves badly and reads worse.
-    """
-    merged: list[tuple[str, str]] = []
-    for heading, text in sections:
+    sections: list[tuple[str, int, int]], smallest: int, largest: int
+) -> list[tuple[str, int, int]]:
+    """Merge neighbouring spans without removing their headings or separators."""
+    merged = []
+    for heading, start, end in sections:
         if not merged:
-            merged.append((heading, text))
+            merged.append((heading, start, end))
             continue
-
-        previous_heading, previous_text = merged[-1]
-        either_is_short = len(previous_text) < smallest or len(text) < smallest
-        if either_is_short and len(previous_text) + len(text) <= largest:
-            merged[-1] = (shared_heading(previous_heading, heading), f"{previous_text}\n\n{text}")
+        previous_heading, previous_start, previous_end = merged[-1]
+        either_is_short = previous_end - previous_start < smallest or end - start < smallest
+        if either_is_short and end - previous_start <= largest:
+            merged[-1] = (shared_heading(previous_heading, heading), previous_start, end)
             continue
-        merged.append((heading, text))
+        merged.append((heading, start, end))
     return merged
 
 
@@ -279,38 +271,19 @@ def shared_heading(left: str, right: str) -> str:
     return " > ".join(shared)
 
 
-def split_to_fit(text: str, largest: int) -> list[str]:
-    """Break text down until every piece fits, coarsest separator first.
-
-    Paragraphs normally. A lecture transcript can run 40,000 characters without
-    a single blank line in it, so an oversized paragraph falls back to lines,
-    and a single oversized line is cut on length.
-    """
-    if len(text) <= largest:
-        return [text]
-    for separator in SEPARATORS:
-        parts = text.split(separator)
-        if len(parts) > 1:
-            return [piece for part in parts for piece in split_to_fit(part, largest)]
-    return [text[start: start + largest] for start in range(0, len(text), largest)]
-
-
-def pack(pieces: list[str], largest: int, smallest: int) -> list[str]:
-    """Refill the split pieces up to the budget, so chunks are not needlessly small."""
-    packed: list[str] = []
-    current = ""
-    for piece in pieces:
-        if current and len(current) + len(piece) + 2 > largest:
-            packed.append(current)
-            current = piece
-            continue
-        current = f"{current}\n\n{piece}" if current else piece
-
-    if not current:
-        return packed
-    # A short tail reads as a fragment, so it rides along with the piece before it.
-    if packed and len(current) < smallest:
-        packed[-1] = f"{packed[-1]}\n\n{current}"
-        return packed
-    packed.append(current)
-    return packed
+def split_spans(body: str, start: int, end: int, largest: int) -> list[tuple[int, int]]:
+    """Prefer paragraph and line boundaries, falling back to a character limit."""
+    spans = []
+    while end - start > largest:
+        cut = start + largest
+        paragraph = body.rfind("\n\n", start + 1, cut)
+        newline = body.rfind("\n", start + 1, cut)
+        if paragraph != -1 and has_content(body[start:paragraph + 2]):
+            cut = paragraph + 2
+        elif newline != -1 and has_content(body[start:newline + 1]):
+            cut = newline + 1
+        spans.append((start, cut))
+        start = cut
+    if start < end:
+        spans.append((start, end))
+    return spans

@@ -1,10 +1,4 @@
-"""Grouping the vault into themes, for questions no single passage answers.
-
-"What are the main themes in my thesis notes" cannot be answered by retrieving
-eight passages, because the answer is a property of the whole set. Clustering
-the vectors already in the index gives the groups, and the model is asked to
-name each one. That is eight calls rather than one per note.
-"""
+"""Cluster existing note vectors and ask Ollama to name each group."""
 
 from __future__ import annotations
 
@@ -49,12 +43,13 @@ def find_themes(
         return []
 
     labels = cluster(matrix, count)
-    titles = note_titles(connection, paths)
+    titles = {
+        row["path"]: row["title"] for row in connection.execute("SELECT path, title FROM notes")
+    }
 
     found = []
     for group in range(count):
         members = [path for path, label in zip(paths, labels) if label == group]
-        # A pair of notes is a coincidence, not a theme.
         if len(members) < SMALLEST_THEME:
             continue
         found.append(Theme(name=name_group(members, titles, model), paths=members))
@@ -62,12 +57,7 @@ def find_themes(
 
 
 def make_names_distinct(found: list[Theme]) -> list[Theme]:
-    """Separate themes the model happened to give the same name.
-
-    Two clusters of daily notes are genuinely different groups, and showing
-    "Daily Notes" twice tells the reader nothing about which is which. The
-    folder they mostly live in is the cheapest true distinguisher.
-    """
+    """Disambiguate repeated names with the most common folder."""
     seen: set[str] = set()
     distinct = []
     for theme in found:
@@ -98,11 +88,7 @@ def scoped_vectors(
 
 
 def cluster(matrix: np.ndarray, count: int, rounds: int = 25, seed: int = 7) -> np.ndarray:
-    """k-means over unit vectors, which is about twenty lines of numpy.
-
-    scikit-learn would do this better and weighs 30 MB. At 452 notes the
-    difference is invisible, so the dependency does not earn its place.
-    """
+    """Group unit vectors using cosine similarity and normalized cluster means."""
     generator = np.random.default_rng(seed)
     centres = matrix[generator.choice(len(matrix), size=count, replace=False)].copy()
 
@@ -134,26 +120,20 @@ def unit(vector: np.ndarray) -> np.ndarray:
     return vector if length == 0 else vector / length
 
 
-def note_titles(connection: sqlite3.Connection, paths: list[str]) -> dict[str, str]:
-    rows = connection.execute("SELECT path, title FROM notes").fetchall()
-    known = {row["path"]: row["title"] for row in rows}
-    return {path: known.get(path, Path(path).stem) for path in paths}
-
-
 def name_group(members: list[str], titles: dict[str, str], model: str) -> str:
     """Name a cluster from its titles, falling back to the commonest folder."""
     sample = [titles.get(path, Path(path).stem) for path in members[:20]]
     try:
-        reply = "".join(
-            ollama.stream_reply(
-                [{"role": "user", "content": NAMING_PROMPT.format(titles="\n".join(sample))}],
-                model,
-                context_size=4096,
-            )
+        reply = ollama.complete(
+            [{"role": "user", "content": NAMING_PROMPT.format(titles="\n".join(sample))}],
+            model, context_size=4096, num_predict=800, timeout=600,
         )
     except ollama.OllamaError:
         return common_folder(members)
-    name = reply.strip().strip('"').splitlines()[0] if reply.strip() else ""
+    if reply.done_reason == "length":
+        return common_folder(members)
+    content = reply.content.strip().strip('"')
+    name = content.splitlines()[0] if content else ""
     return name[:60] or common_folder(members)
 
 

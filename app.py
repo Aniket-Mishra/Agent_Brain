@@ -195,18 +195,13 @@ def show_summary(connection: sqlite3.Connection, vault: Path) -> None:
 
 
 def show_scope(connection: sqlite3.Connection) -> Scope:
-    """Narrow what gets searched, using the frontmatter the notes already carry.
-
-    A date filter beats parsing dates out of the question. "March 2026" as free
-    text matched the words March and 2026 and returned January notes; as a
-    range it cannot be wrong.
-    """
-    available = links.kinds(connection)
+    """Filter searches by note type and date range."""
+    available = dict(links.kinds(connection))
     st.sidebar.markdown("**Search in**")
     chosen = st.sidebar.multiselect(
         "Note types",
-        [kind for kind, _total in available],
-        format_func=lambda kind: f"{kind} ({dict(available)[kind]})",
+        list(available),
+        format_func=lambda kind: f"{kind} ({available[kind]})",
         placeholder="every type",
         key="scope_kinds",
     )

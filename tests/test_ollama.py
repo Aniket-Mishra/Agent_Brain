@@ -1,4 +1,3 @@
-import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,9 +23,15 @@ def test_native_reply_preserves_calls_and_usage() -> None:
 
 def test_native_thinking_is_separate_from_the_displayed_answer(monkeypatch) -> None:
     monkeypatch.setattr(ollama, "model_details", lambda _model: {"capabilities": ["thinking"]})
-    body = ollama.chat_body([{"role": "user", "content": "Question"}], "local", 4096, False, 800)
-    assert body["think"] is True
-    reply = ollama.parse_reply({"message": {"thinking": "Private reasoning [E99]", "content": "Answer [E1]"}})
+    sent = []
+
+    def request(_route, body, **_options):
+        sent.append(body)
+        return {"message": {"thinking": "Private reasoning [E99]", "content": "Answer [E1]"}, "done": True}
+
+    monkeypatch.setattr(ollama, "request", request)
+    reply = ollama.complete([{"role": "user", "content": "Question"}], "local", 4096)
+    assert sent[0]["think"] is True
     assert reply.content == "Answer [E1]"
     assert reply.thinking == "Private reasoning [E99]"
 
@@ -58,29 +63,12 @@ def test_survey_with_missing_arguments_is_valid() -> None:
     assert reply.tool_calls == (ollama.ToolCall("survey", {}),)
 
 
-@pytest.mark.parametrize("frame", [b"broken\n", b"[]\n", b'{"error":"model failed"}\n', b'{"message":null}\n', b'{"message":{"content":7}}\n'])
-def test_invalid_stream_frames_have_transport_error(frame) -> None:
-    with pytest.raises(ollama.OllamaError):
-        list(ollama.read_events(io.BytesIO(frame)))
-
-
-def test_stream_stops_at_done() -> None:
-    frames = b'\n{"message":{"content":"SQLite"}}\n{"done":true}\ninvalid\n'
-    assert list(ollama.read_events(io.BytesIO(frames))) == ["SQLite"]
-
-
-@pytest.mark.parametrize("frame", [b'{"message":{"content":"partial"}}\n', b'{"done":true,"done_reason":"length"}\n'])
-def test_incomplete_stream_cannot_be_presented_as_a_good_answer(frame) -> None:
-    with pytest.raises(ollama.OllamaError, match="complete answer"):
-        list(ollama.read_events(io.BytesIO(frame)))
-
-
 def test_completion_omits_tools_and_forwards_execution_limits(monkeypatch) -> None:
     sent = []
 
     def request(route, body, **options):
         sent.append((route, body, options))
-        return {} if route == "/api/show" else {"message": {"content": "Answer"}}
+        return {} if route == "/api/show" else {"message": {"content": "Answer"}, "done": True}
 
     monkeypatch.setattr(ollama, "request", request)
     assert ollama.complete([], "local", 4096, num_predict=123, timeout=17).content == "Answer"
@@ -88,7 +76,18 @@ def test_completion_omits_tools_and_forwards_execution_limits(monkeypatch) -> No
     assert route == "/api/chat" and "tools" not in body
     assert body["options"] == {"temperature": 0.2, "num_ctx": 4096, "num_predict": 123}
     assert body["truncate"] is False and body["shift"] is False
+    assert body["stream"] is False
     assert options == {"timeout": 17}
+
+
+@pytest.mark.parametrize("done", [None, False, 0, 1, "true"])
+def test_completion_rejects_missing_or_invalid_done(monkeypatch, done) -> None:
+    payload = {"message": {"content": "Partial answer"}}
+    if done is not None:
+        payload["done"] = done
+    monkeypatch.setattr(ollama, "request", lambda route, *_args, **_options: {} if route == "/api/show" else payload)
+    with pytest.raises(ollama.OllamaError, match="complete answer"):
+        ollama.complete([], "local", 4096)
 
 
 @pytest.mark.parametrize("vector", [[], [float("nan")], [float("inf")], [True], ["1"], None])
@@ -153,7 +152,10 @@ def test_transport_bypasses_proxy_and_refuses_redirect(monkeypatch) -> None:
             else:
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b"invalid" if self.path == "/invalid-json" else b"[]" if self.path == "/invalid-shape" else b'{"ok":true}')
+                self.wfile.write(
+                    b"invalid" if self.path == "/invalid-json" else b"[]" if self.path == "/invalid-shape"
+                    else b'{"error":"model failed"}' if self.path == "/model-error" else b'{"ok":true}'
+                )
 
         def log_message(self, *_args):
             pass
@@ -169,9 +171,11 @@ def test_transport_bypasses_proxy_and_refuses_redirect(monkeypatch) -> None:
             for route in ("/invalid-json", "/invalid-shape"):
                 with pytest.raises(ollama.OllamaError, match="invalid"):
                     ollama.request(route, None, timeout=2)
+            with pytest.raises(ollama.OllamaError, match="model failed"):
+                ollama.request("/model-error", None, timeout=2)
             with pytest.raises(ollama.OllamaError, match="302"):
                 ollama.request("/redirect", None, timeout=2)
-            assert reached == ["/plain", "/invalid-json", "/invalid-shape", "/redirect"]
+            assert reached == ["/plain", "/invalid-json", "/invalid-shape", "/model-error", "/redirect"]
         finally:
             server.shutdown()
             worker.join()

@@ -27,11 +27,7 @@ def render(connection: sqlite3.Connection, vault: Path) -> None:
 
 
 def choose_note(paths: list[str]) -> str | None:
-    """Filter across everything, or drill into one folder.
-
-    A tree of all 41 folders is a longer list than the notes inside most of
-    them, so the folder is a single picker and only its notes get rendered.
-    """
+    """Filter all notes or select one folder."""
     needle = st.text_input("Filter", placeholder="part of a note or folder name").strip().lower()
     if needle:
         matching = [path for path in paths if needle in path.lower()]
@@ -65,8 +61,7 @@ def folder_of(path: str | None) -> str:
 
 
 def note_buttons(paths: list[str], key: str) -> str | None:
-    # A fixed height keeps the list scrolling on its own. Without it a folder of
-    # 174 notes pushes the note being read off the bottom of the page.
+    # Keep the list scrolling without pushing the reader down.
     with st.container(height=520):
         notelist.show(paths, key=key, shown=len(paths))
     return st.session_state.get("selected_note")
@@ -100,8 +95,6 @@ def show_note(connection: sqlite3.Connection, vault: Path, path: str | None) -> 
         return
     st.divider()
     with st.container(height=520):
-        # The parsed body, so the YAML block does not land on the page as a
-        # paragraph of `type: college_notes tags: ... subject_code:`.
         st.markdown(note.body)
 
 
@@ -118,9 +111,6 @@ def show_similar(connection: sqlite3.Connection, path: str) -> None:
     nearby = similar_notes(connection, path, limit=5)
     if not nearby:
         return
-    # The scores sit between 0.93 and 0.94 across the whole vault, so the order
-    # carries meaning and the number does not. Showing it would imply precision
-    # that is not there.
     st.caption("**Related, and not yet linked**")
     notelist.show([other for other, _score in nearby], key="similar", shown=len(nearby))
 

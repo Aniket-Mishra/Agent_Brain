@@ -24,7 +24,8 @@ def app_backend(tmp_path, monkeypatch):
         (vault / f"{name}.md").write_text(f"---\ntype: {kind}\ncreated: {created}\n---\n# Decision\n{body}\n")
     state = {
         "vault": vault, "status": "answered", "error": False,
-        "loop_calls": [], "stream_calls": [], "theme_calls": [],
+        "loop_calls": [], "search_calls": [], "theme_calls": [],
+        "reply": "SQLite stores local passages [E1].",
         "database_path": locate.database_path,
     }
     monkeypatch.delenv("AGENT_BRAIN_VAULT", raising=False)
@@ -43,9 +44,9 @@ def app_backend(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ollama, "request", no_network)
 
-    def stream(messages, model, context_size, *, num_predict=800):
-        state["stream_calls"].append((messages, num_predict))
-        yield "SQLite stores local passages [1]."
+    def complete(messages, model, context_size, *, num_predict=800):
+        state["search_calls"].append((messages, num_predict))
+        return ollama.Reply(state["reply"])
 
     def answer(connection, question, **options):
         state["loop_calls"].append((question, options))
@@ -53,7 +54,7 @@ def app_backend(tmp_path, monkeypatch):
             raise ollama.OllamaError("synthetic model failure")
         options["progress"]("read")
         hits = (
-            Hit(1, "Focus.md", "Storage choice", "Storage > Decision", "x" * 1600 + " visible tail [cut]", "research", "2026-03-10", found_by={"read"}),
+            Hit(1, "Focus.md", "Storage choice", "Storage > Decision", "x" * 1600 + " visible tail", "research", "2026-03-10", found_by={"read"}, start_line=6, end_line=6, truncated=True),
             Hit(2, "Peer.md", "Recovery plan", "Recovery", "Rebuild the index.", "research", "2026-03-11", found_by={"words"}),
         )
         return loop.Turn(
@@ -66,7 +67,7 @@ def app_backend(tmp_path, monkeypatch):
         state["theme_calls"].append((model, count, scope))
         return [themes.Theme("Storage", ["Focus.md", "Peer.md"])]
 
-    monkeypatch.setattr(ollama, "stream_reply", stream)
+    monkeypatch.setattr(ollama, "complete", complete)
     monkeypatch.setattr(loop, "answer", answer)
     monkeypatch.setattr(themes, "find_themes", find_themes)
     st.cache_data.clear()
@@ -85,28 +86,40 @@ def test_search_stays_default_and_tool_mode_renders_admitted_sources(app_backend
     assert app.number_input(key="generation_tokens").value == loop.Limits().num_predict
     app.number_input(key="generation_tokens").set_value(1536).run()
     app.chat_input[0].set_value("SQLite storage question").run()
-    assert not app.exception and len(app_backend["stream_calls"]) == 1
-    assert app_backend["stream_calls"][-1][1] == 1536
+    assert not app.exception and len(app_backend["search_calls"]) == 1
+    assert app_backend["search_calls"][-1][1] == 1536
     assert not app_backend["loop_calls"]
-    assert any("[1] Focus" in element.value for element in app.markdown)
+    assert any("[E1] Focus" in element.value for element in app.markdown)
+    assert any("Focus.md:5-6" in element.value for element in app.caption)
     app.checkbox(key="explore_with_tools").check().run()
     app.chat_input[0].set_value("Follow up").run()
     assert not app.exception
-    assert app_backend["loop_calls"][-1][1]["prior"] == ("SQLite storage question", "SQLite stores local passages [1].")
+    assert app_backend["loop_calls"][-1][1]["prior"] == ("SQLite storage question", "SQLite stores local passages [E1].")
     assert app_backend["loop_calls"][-1][1]["limits"].num_predict == 1536
     shown = "\n".join(element.value for element in app.markdown)
     assert "[E1] Storage choice · cited" in shown and "[E2] Recovery plan · retrieved" in shown
     assert "[I1] cited" in shown
-    assert any("visible tail [cut]" in element.value for element in app.text)
+    assert any("visible tail\n[cut]" in element.value for element in app.text)
     assert any("Storage > Decision" in element.value and "found by read" in element.value for element in app.caption)
     assert app.session_state["history"][-1]["turn"].evidence[0].title == "Storage choice"
-    calls = (len(app_backend["stream_calls"]), len(app_backend["loop_calls"]))
+    calls = (len(app_backend["search_calls"]), len(app_backend["loop_calls"]))
     for bad_value in (128.5, 4097):
         monkeypatch.setattr(st, "number_input", lambda *_args, **_kwargs: bad_value)
         app.run()
         assert not app.exception and not app.chat_input
         assert app.error and "Generation tokens must be an integer from 128 to 4096" in app.error[0].value
-        assert (len(app_backend["stream_calls"]), len(app_backend["loop_calls"])) == calls
+        assert (len(app_backend["search_calls"]), len(app_backend["loop_calls"])) == calls
+
+
+def test_search_rejects_unknown_citations_before_display(app_backend) -> None:
+    app_backend["reply"] = "Invented answer [E99]."
+    app = AppTest.from_file(APP).run()
+    app.chat_input[0].set_value("SQLite storage question").run()
+    assert not app.exception
+    shown = "\n".join(element.value for element in app.markdown)
+    assert "Invented answer" not in shown
+    assert "Insufficient evidence:" in shown
+    assert "chat_prior" not in app.session_state
 
 
 def test_prior_survives_good_filtered_turns_and_resets_on_scope_or_vault_change(app_backend) -> None:
